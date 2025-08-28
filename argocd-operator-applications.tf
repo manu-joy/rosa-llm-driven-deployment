@@ -240,14 +240,14 @@ OPENSHIFT_SERVICEMESH_APP_EOF
       echo "OpenShift Service Mesh operator application created"
 
       # Wait for SMCP object to be created and ready
-      echo "Waiting for ServiceMeshControlPlane to be created..."
-      timeout 600 bash -c 'until oc get smcp data-science-smcp -n istio-system 2>/dev/null; do echo "Waiting for SMCP..."; sleep 10; done'
+ #     echo "Waiting for ServiceMeshControlPlane to be created..."
+ #     timeout 600 bash -c 'until oc get smcp data-science-smcp -n istio-system 2>/dev/null; do echo "Waiting for SMCP..."; sleep 10; done'
 
       # Apply authorino patch to SMCP
-      echo "Patching ServiceMeshControlPlane with authorino configuration..."
-      oc patch smcp data-science-smcp --type merge -n istio-system --patch-file ${path.module}/authorino.yml
+ #     echo "Patching ServiceMeshControlPlane with authorino configuration..."
+ #     oc patch smcp data-science-smcp --type merge -n istio-system --patch-file ${path.module}/authorino.yml
 
-      echo "ServiceMeshControlPlane patched with authorino configuration"
+ #     echo "ServiceMeshControlPlane patched with authorino configuration"
     EOF
   }
 
@@ -296,7 +296,7 @@ spec:
   source:
     repoURL: https://github.com/sureshgaikwad/gitops-catalog
     targetRevision: HEAD
-    path: operators/NodeFileDiscoveryOperator
+    path: operators/node-file-discovery-operator
   destination:
     server: https://kubernetes.default.svc
     namespace: openshift-nfd

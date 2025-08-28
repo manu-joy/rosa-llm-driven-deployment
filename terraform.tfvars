@@ -169,7 +169,7 @@ enable_proxy = false
 deploy_openshift_gitops = true
 deploy_vote_application = true
 gitops_repo_url         = "https://github.com/sureshgaikwad/gitops-catalog"
-application_repo_path        = "vote-application"
+application_repo_path        = "application/vote-application"
 
 ##############################################################
 # Operator Deployments   
