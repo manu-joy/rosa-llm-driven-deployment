@@ -5,7 +5,7 @@
 # Required Variables
 ##############################################################
 cluster_name      = "my-rosa-cluster"
-openshift_version = "4.19.3"
+openshift_version = "4.19.10"
 aws_region        = "us-east-1"
 
 

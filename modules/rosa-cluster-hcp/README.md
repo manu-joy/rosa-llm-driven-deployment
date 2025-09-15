@@ -16,7 +16,7 @@ module "rosa_cluster_hcp" {
 
   cluster_name           = "my-cluster"
   operator_role_prefix   = "my-operators"
-  openshift_version      = "4.14.24"
+  openshift_version      = "4.19.10"
   installer_role_arn     = "arn:aws:iam::012345678912:role/ManagedOpenShift-HCP-ROSA-Installer-Role"
   support_role_arn       = "arn:aws:iam::012345678912:role/ManagedOpenShift-HCP-ROSA-Support-Role"
   worker_role_arn        = "arn:aws:iam::012345678912:role/ManagedOpenShift-HCP-ROSA-Worker-Role"
