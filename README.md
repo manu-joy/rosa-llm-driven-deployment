@@ -1,11 +1,409 @@
-# terraform-rhcs-rosa-hcp
-Terraform module which creates ROSA HCP cluster
+# AI Assistant Supported ROSA & AI Components Deployment
 
-## Introduction
+Comprehensive automation suite for deploying Red Hat OpenShift Service on AWS (ROSA) HCP clusters with integrated AI capabilities including OpenShift AI, Llama Stack, and agentic AI demonstrations using AI code assistants like Cursor.
+
+## 📋 Table of Contents
+
+- [Overview](#overview)
+- [AI-Powered Deployment with Code Assistants](#ai-powered-deployment-with-code-assistants)
+- [Terraform Automation](#terraform-automation)
+- [Complete AI Stack Deployment](#complete-ai-stack-deployment)
+- [Getting Started](#getting-started)
+
+## Overview
+
+This repository provides AI-powered deployment approaches for the complete ROSA + AI stack:
+
+### Deployment Methods
+1. **🤖 AI Assistant-Led Terraform** - Production-ready IaC deployment through Cursor
+2. **⚡ AI Assistant-Led CLI** - Quick CLI-based deployment through Cursor
+
+### What You Can Deploy
+3. **☸️ ROSA HCP Clusters** - Red Hat OpenShift Service on AWS with Hosted Control Plane
+4. **🧠 OpenShift AI Platform** - Complete AI/ML platform with GPU support
+5. **🦙 Llama Stack** - LLM inference infrastructure with vLLM/TGI backends
+6. **🎯 Agentic AI Demo** - Pre-built agentic AI demonstration with MCP servers
+
+---
+
+## 🤖 AI-Powered Deployment with Code Assistants
+
+### Using ROSA Cluster Creation with Cursor or Other AI Code Assistants
+
+This repository includes comprehensive documentation that enables AI code assistants like **Cursor**, **GitHub Copilot**, or other LLM-based coding tools to automatically deploy complete ROSA clusters with OpenShift AI, Llama Stack, and agentic AI demonstrations.
+
+#### 📖 Key Documentation Files
+
+##### 1. **ROSA Cluster Creation Agent Instructions** 
+📄 [`ROSA Cluster creation agent instructions.md`](./ROSA%20Cluster%20creation%20agent%20instructions.md)
+
+**Purpose**: Comprehensive instructions for LLM agents to act as ROSA deployment experts
+
+**What It Enables**:
+- ✅ Automated ROSA HCP cluster creation through conversational AI
+- ✅ Input validation and prerequisite checking
+- ✅ Step-by-step guided deployment with error handling
+- ✅ Support for both Terraform and CLI deployment methods
+- ✅ Context preservation during long-running deployments
+- ✅ Network configuration options (Public, Private, Zero Egress)
+- ✅ Complete resource inventory and cleanup instructions
+
+**Usage**:
+```bash
+# In Cursor or your AI code assistant:
+"Create a ROSA HCP cluster in Singapore with 3 m5.4xlarge worker nodes. 
+Use the instructions in 'ROSA Cluster creation agent instructions.md'"
+
+# The AI assistant will:
+# 1. Read the comprehensive instructions
+# 2. Validate prerequisites (AWS credentials, ROSA CLI, etc.)
+# 3. Guide you through configuration options
+# 4. Execute deployment commands
+# 5. Monitor progress and handle errors
+# 6. Provide complete cluster access details
+```
+
+**Key Features**:
+- **Validation Catalog**: Mandatory and optional parameter validation rules
+- **Error Handling Protocol**: Strict rules for handling deployment failures
+- **Multiple Deployment Methods**: Terraform (production) or CLI (quick)
+- **Network Flexibility**: Public, Private, or Zero Egress cluster configurations
+- **Resource Naming Conventions**: Consistent naming for all AWS resources
+- **Comprehensive Prerequisites**: AWS and ROSA setup checklist with verification commands
+
+##### 2. **OpenShift AI Setup Guide**
+📄 [`OpenShift AI setup.md`](./OpenShift%20AI%20setup.md)
+
+**Purpose**: Complete deployment guide for adding OpenShift AI capabilities to ROSA clusters
+
+**What It Enables**:
+- ✅ Deploy OpenShift AI operator on ROSA
+- ✅ Configure GPU support for ML workloads
+- ✅ Set up data science workbenches
+- ✅ Deploy model serving infrastructure
+- ✅ Configure S3 storage for models and artifacts
+
+**Usage with AI Assistant**:
+```bash
+# After ROSA cluster is deployed:
+"Deploy OpenShift AI on my ROSA cluster using the OpenShift AI setup.md guide"
+
+# The AI assistant will:
+# 1. Verify ROSA cluster is ready
+# 2. Check prerequisites for OpenShift AI
+# 3. Deploy the operator and components
+# 4. Configure storage and GPU support
+# 5. Set up workbench environments
+# 6. Verify installation success
+```
+
+##### 3. **Llama Stack Integration Guide**
+📄 [`Llama Stack OpenShift AI Integration Guide.md`](./Llama%20Stack%20OpenShift%20AI%20Integration%20Guide.md)
+
+**Purpose**: Deploy Meta's Llama Stack for LLM inference on OpenShift AI
+
+**What It Enables**:
+- ✅ Llama Stack server deployment on OpenShift
+- ✅ Model serving with vLLM or TGI backends
+- ✅ Integration with OpenShift AI
+- ✅ MCP (Model Context Protocol) server support
+- ✅ Connection to agentic AI frameworks
+
+**Usage with AI Assistant**:
+```bash
+"Deploy Llama Stack on my ROSA cluster following the Llama Stack integration guide"
+
+# The AI assistant will:
+# 1. Deploy Llama Stack server pods
+# 2. Configure model serving endpoints
+# 3. Set up inference routes
+# 4. Connect to OpenShift AI workbenches
+# 5. Verify model serving capabilities
+```
+
+##### 4. **Agentic AI Demo**
+📁 [`rhai-agentic-demo/`](./rhai-agentic-demo/)
+
+**Purpose**: Complete working demonstration of agentic AI with MCP servers
+
+**What It Includes**:
+- 🎯 **UI**: Streamlit-based chat interface for agent interactions
+- 🔧 **MCP Servers**: CRM, PDF, and Slack integration servers
+- 🗄️ **Database**: PostgreSQL for CRM data storage
+- 🤖 **Agent Scripts**: ReAct agent with multi-MCP support
+- 📊 **Notebooks**: Jupyter notebooks for experimentation
+- ☸️ **Kubernetes Manifests**: Complete deployment configurations
+
+**Usage with AI Assistant**:
+```bash
+"Deploy the agentic AI demo from rhai-agentic-demo/ on my ROSA cluster"
+
+# The AI assistant will:
+# 1. Deploy PostgreSQL database with sample CRM data
+# 2. Deploy MCP servers (CRM, PDF, Slack)
+# 3. Deploy Llama Stack for LLM inference
+# 4. Deploy UI application
+# 5. Configure networking and routes
+# 6. Provide access URLs and usage instructions
+```
+
+#### 🚀 Complete End-to-End Deployment with AI Assistant
+
+Here's how to deploy the entire stack using an AI code assistant like Cursor:
+
+**Step 1: Initial Setup**
+```bash
+# In your AI code assistant terminal:
+"Set up my environment for ROSA deployment:
+1. Verify AWS CLI is configured with account 371594374265
+2. Verify ROSA CLI is installed and authenticated
+3. Check prerequisites using 'ROSA Cluster creation agent instructions.md'"
+```
+
+**Step 2: Create ROSA Cluster**
+```bash
+"Create a ROSA HCP cluster with these requirements:
+- Name: ai-demo-cluster
+- Region: Singapore (ap-southeast-1)
+- Worker nodes: 3 x m5.4xlarge
+- Network: Public API and ingress
+- Use the agent instructions for deployment"
+```
+
+**Step 3: Deploy OpenShift AI**
+```bash
+"Now deploy OpenShift AI on the ai-demo-cluster following 
+the OpenShift AI setup.md guide"
+```
+
+**Step 4: Deploy Llama Stack**
+```bash
+"Deploy Llama Stack using the Llama Stack OpenShift AI Integration Guide"
+```
+
+**Step 5: Deploy Agentic AI Demo**
+```bash
+"Deploy the complete agentic AI demo from rhai-agentic-demo/ 
+including all MCP servers, database, and UI"
+```
+
+#### 📊 What Gets Deployed Automatically
+
+When using the AI assistant with these instructions, you get:
+
+**Infrastructure Layer**:
+- ☸️ ROSA HCP Cluster with 3 worker nodes
+- 🌐 VPC with public/private subnets
+- 🔐 IAM roles and OIDC provider
+- 🔒 Security groups and network policies
+
+**AI/ML Platform**:
+- 🧠 OpenShift AI Operator
+- 📚 Data Science workbenches
+- 🎯 Model serving infrastructure
+- 💾 S3 storage configuration
+
+**Llama Stack**:
+- 🦙 Llama Stack server
+- ⚡ vLLM/TGI model serving
+- 🔌 Inference API endpoints
+- 📡 MCP server integration
+
+**Agentic AI Demo**:
+- 🎨 Streamlit UI for agent chat
+- 🔧 MCP Servers (CRM, PDF, Slack)
+- 🗄️ PostgreSQL with sample data
+- 🤖 ReAct agent framework
+- 📊 Jupyter notebooks for exploration
+
+#### 🎯 Benefits of AI-Assisted Deployment
+
+1. **Zero Manual Configuration**: AI assistant reads the comprehensive instructions and handles all steps
+2. **Error Recovery**: Built-in error handling and context preservation across failures
+3. **Prerequisites Validation**: Automatic checking of all requirements before deployment
+4. **Progress Monitoring**: Real-time status updates during 20-30 minute deployments
+5. **Complete Documentation**: Every resource is documented and explained
+6. **Cleanup Support**: Guided teardown when you're done
+7. **Best Practices**: Follows Red Hat and AWS recommended configurations
+
+#### ⚠️ Important Notes for AI-Assisted Deployment
+
+**Prerequisites**:
+- ✅ AWS account with ROSA enabled
+- ✅ AWS CLI configured with credentials
+- ✅ ROSA CLI installed and authenticated
+- ✅ Billing account linked to Red Hat (for HCP clusters)
+- ✅ Sufficient AWS quotas (100+ vCPUs)
+
+**Token Management**:
+- Use persistent offline token from https://console.redhat.com/openshift/token
+- DO NOT use `rosa token` output (expires during deployment)
+- Set `export RHCS_TOKEN="<your-persistent-token>"` before Terraform deployments
+
+**Deployment Time**:
+- ROSA Cluster: 20-30 minutes
+- OpenShift AI: 10-15 minutes
+- Llama Stack: 5-10 minutes
+- Agentic Demo: 5-10 minutes
+- **Total**: ~45-65 minutes for complete stack
+
+#### 📖 Reading Order for Manual Reference
+
+If you want to understand the process before using AI assistance:
+
+1. Read [`ROSA Cluster creation agent instructions.md`](./ROSA%20Cluster%20creation%20agent%20instructions.md) - Understand ROSA deployment
+2. Read [`OpenShift AI setup.md`](./OpenShift%20AI%20setup.md) - Learn about AI platform setup
+3. Read [`Llama Stack OpenShift AI Integration Guide.md`](./Llama%20Stack%20OpenShift%20AI%20Integration%20Guide.md) - Understand LLM serving
+4. Explore [`rhai-agentic-demo/README.md`](./rhai-agentic-demo/README.md) - See demo architecture
+
+---
+
+## 🧠 Complete AI Stack Deployment
+
+### Full Stack Architecture
+
+When deploying the complete AI stack, you get a production-ready environment for running agentic AI applications:
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                         ROSA HCP Cluster                         │
+│  ┌───────────────────────────────────────────────────────────┐  │
+│  │                    OpenShift AI Platform                  │  │
+│  │  ┌─────────────────────────────────────────────────────┐  │  │
+│  │  │            Llama Stack (LLM Inference)             │  │  │
+│  │  │  ┌──────────────────────────────────────────────┐  │  │  │
+│  │  │  │         Agentic AI Demo Application          │  │  │  │
+│  │  │  │                                               │  │  │  │
+│  │  │  │  ┌────────────┐  ┌────────────┐             │  │  │  │
+│  │  │  │  │ Streamlit  │  │ PostgreSQL │             │  │  │  │
+│  │  │  │  │     UI     │  │  Database  │             │  │  │  │
+│  │  │  │  └────────────┘  └────────────┘             │  │  │  │
+│  │  │  │                                               │  │  │  │
+│  │  │  │  ┌──────────────────────────────────────┐   │  │  │  │
+│  │  │  │  │        MCP Servers                    │   │  │  │  │
+│  │  │  │  │  • CRM Integration                    │   │  │  │  │
+│  │  │  │  │  • PDF Processing                     │   │  │  │  │
+│  │  │  │  │  • Slack Integration                  │   │  │  │  │
+│  │  │  │  └──────────────────────────────────────┘   │  │  │  │
+│  │  │  └──────────────────────────────────────────────┘  │  │  │
+│  │  └─────────────────────────────────────────────────────┘  │  │
+│  └───────────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Deployment Approaches
+
+**Option 1: AI Assistant-Led Terraform Deployment (Recommended for Production)**
+- AI code assistant (Cursor) handles Terraform automation
+- Infrastructure as Code with version control
+- Repeatable, declarative deployments
+- State management and drift detection
+- Best for: Production environments, enterprise deployments, long-term infrastructure management
+
+**Option 2: AI Assistant-Led CLI Deployment (Recommended for Quick Start)**
+- AI code assistant (Cursor) executes ROSA CLI commands
+- Faster initial deployment (no Terraform setup)
+- Direct interaction with ROSA APIs
+- Real-time progress monitoring
+- Best for: Development, testing, learning, proof-of-concepts
+
+Both approaches leverage AI assistants to:
+- ✅ Validate prerequisites automatically
+- ✅ Handle errors and provide solutions
+- ✅ Preserve context during long-running deployments
+- ✅ Provide complete documentation of created resources
+
+---
+
+## 🚀 Getting Started
+
+### Quick Start (5 Minutes to Deployment)
+
+**Using Cursor or AI Code Assistant**:
+
+1. **Clone this repository**:
+   ```bash
+   git clone https://github.com/yourusername/rosa-automation
+   cd rosa-automation
+   ```
+
+2. **Set up credentials** (add to your long-term context or `.env`):
+   ```bash
+   export AWS_ACCESS_KEY_ID="your-aws-key"
+   export AWS_SECRET_ACCESS_KEY="your-aws-secret"
+   export RHCS_TOKEN="your-persistent-ocm-token"
+   ```
+
+3. **Ask your AI assistant**:
+   ```
+   "Deploy a complete ROSA cluster with OpenShift AI, Llama Stack, 
+   and the agentic demo in Singapore region. Use the agent instructions 
+   in this repository."
+   ```
+
+4. **Wait 45-65 minutes** while the AI assistant:
+   - Validates prerequisites
+   - Creates ROSA cluster
+   - Deploys OpenShift AI
+   - Sets up Llama Stack
+   - Deploys agentic demo
+   - Provides access URLs
+
+5. **Access your environment**:
+   - OpenShift Console: `https://console-openshift-console.apps.{cluster-domain}`
+   - Agentic UI: `https://ui-route-{namespace}.apps.{cluster-domain}`
+   - Llama Stack API: `https://llama-stack-{namespace}.apps.{cluster-domain}`
+
+### Prerequisites Checklist
+
+Before starting any deployment:
+
+- [ ] **AWS Account**
+  - [ ] Account enabled for ROSA
+  - [ ] AWS CLI installed and configured
+  - [ ] Sufficient quotas (100+ vCPUs)
+  - [ ] ELB service-linked role created
+
+- [ ] **Red Hat Account**
+  - [ ] Red Hat account created
+  - [ ] ROSA CLI installed
+  - [ ] OCM token obtained from https://console.redhat.com/openshift/token
+  - [ ] Billing account linked (for HCP clusters)
+
+- [ ] **Local Tools**
+  - [ ] Terraform installed (for Terraform deployment)
+  - [ ] OpenShift CLI (oc) installed
+  - [ ] Git installed
+  - [ ] Code assistant (Cursor recommended) or manual deployment tools
+
+### Verification Commands
+
+```bash
+# Verify AWS access
+aws sts get-caller-identity
+
+# Verify ROSA CLI
+rosa whoami
+
+# Verify ROSA quotas
+rosa verify quota --region ap-southeast-1
+
+# Verify ROSA permissions
+rosa verify permissions
+
+# Check OpenShift CLI
+oc version
+```
+
+---
+
+## 🔧 Terraform Automation
+
+### Traditional Terraform Module Deployment
 
 This module serves as a comprehensive solution for deploying, configuring and managing Red Hat OpenShift on AWS (ROSA) Hosted Control Plane (HCP) clusters within your AWS environment. With a focus on simplicity and efficiency, this module streamlines the process of setting up and maintaining ROSA HCP clusters, enabling users to use the power of OpenShift on AWS infrastructure effortlessly.
 
-## Example Usage
+### Example Usage
 
 ```
 module "hcp" {
@@ -223,3 +621,220 @@ When `create_vpc = true`, this is handled automatically. When using existing VPC
 | <a name="output_operator_roles_arn"></a> [operator\_roles\_arn](#output\_operator\_roles\_arn) | List of Amazon Resource Names (ARNs) for all operator roles created. |
 | <a name="output_path"></a> [path](#output\_path) | The arn path for the account/operator roles as well as their policies. |
 <!-- END_AUTOMATED_TF_DOCS_BLOCK -->
+
+---
+
+## 📚 Additional Resources
+
+### Documentation Files in This Repository
+
+#### Core Deployment Guides
+- **[ROSA Cluster Creation Agent Instructions](./ROSA%20Cluster%20creation%20agent%20instructions.md)** - Comprehensive LLM agent instructions for automated ROSA deployment
+- **[OpenShift AI Setup Guide](./OpenShift%20AI%20setup.md)** - Complete guide for deploying OpenShift AI on ROSA clusters
+- **[Llama Stack Integration Guide](./Llama%20Stack%20OpenShift%20AI%20Integration%20Guide.md)** - Deploy and integrate Llama Stack for LLM inference
+
+#### Demo Applications
+- **[Agentic AI Demo](./rhai-agentic-demo/)** - Complete working demonstration with MCP servers, UI, and agent framework
+  - [Deployment Documentation](./rhai-agentic-demo/README.md)
+  - [Local Deployment Guide](./rhai-agentic-demo/docs/deploy-demo-local.md)
+  - [Llama Stack Setup](./rhai-agentic-demo/docs/run-llama-stack.md)
+
+#### Deployment Examples
+- [ROSA HCP Public Cluster](./examples/rosa-hcp-public/)
+- [ROSA HCP Private Cluster](./examples/rosa-hcp-private/)
+- [ROSA HCP with Multiple Machine Pools and IDPs](./examples/rosa-hcp-public-with-multiple-machinepools-and-idps/)
+- [ROSA HCP with Shared VPC](./examples/rosa-hcp-private-shared-vpc/)
+- [ROSA HCP with Unmanaged OIDC](./examples/rosa-hcp-public-unmanaged-oidc/)
+
+### External Resources
+
+#### Official Documentation
+- [Red Hat OpenShift Service on AWS (ROSA)](https://docs.openshift.com/rosa/)
+- [ROSA Getting Started Guide](https://console.redhat.com/openshift/create/rosa/getstarted)
+- [ROSA CLI Reference](https://docs.openshift.com/rosa/cli_reference/rosa_cli/rosa-get-started-cli.html)
+- [OpenShift AI Documentation](https://docs.redhat.com/en/documentation/red_hat_openshift_ai_self-managed)
+- [Terraform RHCS Provider](https://registry.terraform.io/providers/terraform-redhat/rhcs/latest/docs)
+
+#### AWS Resources
+- [AWS ROSA Prerequisites](https://docs.aws.amazon.com/ROSA/latest/userguide/rosa-getting-started-prerequisites.html)
+- [AWS Service Quotas](https://console.aws.amazon.com/servicequotas/)
+- [AWS EC2 Instance Types](https://aws.amazon.com/ec2/instance-types/)
+
+#### Learning Resources
+- [Red Hat OpenShift AI Workshops](https://redhatquickcourses.github.io/llm-on-rhoai/)
+- [Meta Llama Stack Documentation](https://llama-stack.readthedocs.io/)
+- [Model Context Protocol (MCP) Specification](https://modelcontextprotocol.io/)
+
+---
+
+## 🎯 Use Cases
+
+This automation suite supports various deployment scenarios:
+
+### 1. **Development & Testing**
+```bash
+"Create a minimal ROSA cluster for testing:
+- 2 worker nodes (m5.xlarge)
+- Public access
+- No GPU support
+- Development/testing tags"
+```
+
+### 2. **AI/ML Workloads**
+```bash
+"Deploy a ROSA cluster for machine learning:
+- 3 GPU worker nodes (g5.4xlarge)
+- OpenShift AI with GPU operator
+- S3 integration for model storage
+- Data science workbenches"
+```
+
+### 3. **Agentic AI Applications**
+```bash
+"Deploy complete agentic AI stack:
+- ROSA HCP cluster
+- OpenShift AI platform
+- Llama Stack for inference
+- MCP servers (CRM, PDF, Slack)
+- Sample agentic UI"
+```
+
+### 4. **Production Workloads**
+```bash
+"Create production-ready ROSA cluster:
+- Private cluster with PrivateLink
+- High availability (multi-AZ)
+- Enterprise security (zero egress)
+- Custom machine pools
+- Monitoring and logging"
+```
+
+### 5. **Hybrid Cloud**
+```bash
+"Deploy ROSA with existing infrastructure:
+- Use existing VPC
+- Integrate with on-prem LDAP
+- Custom networking configuration
+- Shared OIDC provider"
+```
+
+---
+
+## 🔒 Security Considerations
+
+### Network Security
+- **Public Clusters**: API and ingress accessible from internet (good for dev/test)
+- **Private Clusters**: API accessible only within VPC (recommended for production)
+- **Zero Egress**: No outbound internet (highest security, requires VPC endpoints)
+
+### Identity & Access
+- AWS IAM roles and policies follow least-privilege principles
+- OpenShift RBAC for cluster access control
+- OIDC integration for federated authentication
+- Optional integration with enterprise identity providers
+
+### Data Protection
+- Optional etcd encryption at rest
+- EBS volume encryption
+- Network encryption in transit
+- S3 bucket encryption for AI models and artifacts
+
+### Compliance
+- Consistent resource tagging for audit trails
+- Complete deployment documentation
+- Infrastructure-as-Code for reproducibility
+- Automated cleanup procedures
+
+---
+
+## 🤝 Contributing
+
+Contributions are welcome! Please feel free to submit pull requests or open issues for:
+- Bug fixes
+- Documentation improvements
+- New features or examples
+- AI assistant instruction enhancements
+
+---
+
+## 📄 License
+
+See the LICENSE file for details.
+
+---
+
+## 💬 Support
+
+For issues and questions:
+- **ROSA Issues**: [Red Hat Customer Portal](https://access.redhat.com/)
+- **Repository Issues**: [GitHub Issues](https://github.com/yourusername/rosa-automation/issues)
+- **Community**: [OpenShift Community](https://www.openshift.com/community)
+
+---
+
+## 🎓 Quick Reference
+
+### Essential Commands
+
+```bash
+# ROSA Cluster Management
+rosa list clusters
+rosa describe cluster <cluster-name>
+rosa delete cluster <cluster-name>
+
+# OpenShift CLI
+oc login <api-url> -u <username> -p <password>
+oc get nodes
+oc get pods --all-namespaces
+oc projects
+
+# AWS Resources
+aws ec2 describe-vpcs --region <region>
+aws iam list-roles --query 'Roles[?contains(RoleName, `rosa`)]'
+aws resourcegroupstaggingapi get-resources --tag-filters Key=rosa_cluster,Values=<cluster-name>
+
+# Terraform Management
+terraform init
+terraform plan
+terraform apply
+terraform destroy
+terraform output cluster_console_url
+```
+
+### Common Troubleshooting
+
+**Issue: Token expired during deployment**
+```bash
+# Solution: Use persistent offline token
+export RHCS_TOKEN="<get-from-console.redhat.com/openshift/token>"
+```
+
+**Issue: Insufficient AWS quotas**
+```bash
+# Solution: Check and request quota increases
+rosa verify quota --region <region>
+aws service-quotas list-service-quotas --service-code ec2
+```
+
+**Issue: Billing account not linked**
+```bash
+# Solution: Complete setup via Red Hat Console
+# Visit: https://console.redhat.com/openshift/create/rosa/getstarted
+```
+
+**Issue: Network connectivity problems**
+```bash
+# Solution: Verify VPC and subnet configuration
+aws ec2 describe-subnets --filters "Name=vpc-id,Values=<vpc-id>"
+rosa describe cluster <cluster-name> | grep -E "Subnet|VPC"
+```
+
+---
+
+**🚀 Ready to Deploy?**
+
+Choose your AI-assisted deployment method:
+- **Option 1 (Production)**: Ask Cursor to deploy using Terraform with the agent instructions for IaC benefits
+- **Option 2 (Quick Start)**: Ask Cursor to deploy using CLI commands for faster deployment
+
+**Need Help?** Refer to the comprehensive guides in this repository or use your AI code assistant with the included instructions!
