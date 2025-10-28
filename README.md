@@ -52,15 +52,21 @@ This repository includes comprehensive documentation that enables AI code assist
 ```bash
 # In Cursor or your AI code assistant:
 "Create a ROSA HCP cluster in Singapore with 3 m5.4xlarge worker nodes. 
-Use the instructions in 'ROSA Cluster creation agent instructions.md'"
+Use the instructions in 'ROSA Cluster creation agent instructions.md'
+
+IMPORTANT: Strictly follow the instructions in the document. Do not deviate 
+or fall back to alternative methods. If you encounter any situation requiring 
+deviation from the documented process, stop and ask me for guidance before 
+proceeding."
 
 # The AI assistant will:
-# 1. Read the comprehensive instructions
-# 2. Validate prerequisites (AWS credentials, ROSA CLI, etc.)
-# 3. Guide you through configuration options
-# 4. Execute deployment commands
-# 5. Monitor progress and handle errors
+# 1. Read the comprehensive instructions from the specified document
+# 2. Validate prerequisites (AWS credentials, ROSA CLI, etc.) as documented
+# 3. Guide you through configuration options per the instructions
+# 4. Execute deployment commands exactly as specified in the document
+# 5. Monitor progress and handle errors according to the documented procedures
 # 6. Provide complete cluster access details
+# 7. STOP and ask for user guidance if any deviation is needed
 ```
 
 **Key Features**:
@@ -86,15 +92,20 @@ Use the instructions in 'ROSA Cluster creation agent instructions.md'"
 **Usage with AI Assistant**:
 ```bash
 # After ROSA cluster is deployed:
-"Deploy OpenShift AI on my ROSA cluster using the OpenShift AI setup.md guide"
+"Deploy OpenShift AI on my ROSA cluster using the OpenShift AI setup.md guide
+
+IMPORTANT: Strictly follow the instructions in the OpenShift AI setup.md document. 
+Do not deviate or use alternative methods. If you encounter any situation requiring 
+deviation, stop and ask me for guidance before proceeding."
 
 # The AI assistant will:
-# 1. Verify ROSA cluster is ready
-# 2. Check prerequisites for OpenShift AI
-# 3. Deploy the operator and components
-# 4. Configure storage and GPU support
-# 5. Set up workbench environments
-# 6. Verify installation success
+# 1. Verify ROSA cluster is ready per the documented steps
+# 2. Check prerequisites for OpenShift AI as specified
+# 3. Deploy the operator and components exactly as documented
+# 4. Configure storage and GPU support per instructions
+# 5. Set up workbench environments following the guide
+# 6. Verify installation success using documented procedures
+# 7. STOP and ask for user guidance if any deviation is needed
 ```
 
 ##### 3. **Llama Stack Integration Guide**
@@ -111,14 +122,20 @@ Use the instructions in 'ROSA Cluster creation agent instructions.md'"
 
 **Usage with AI Assistant**:
 ```bash
-"Deploy Llama Stack on my ROSA cluster following the Llama Stack integration guide"
+"Deploy Llama Stack on my ROSA cluster following the Llama Stack integration guide
+
+IMPORTANT: Strictly follow the instructions in the Llama Stack OpenShift AI 
+Integration Guide.md document. Do not deviate or use alternative methods. If you 
+encounter any situation requiring deviation, stop and ask me for guidance before 
+proceeding."
 
 # The AI assistant will:
-# 1. Deploy Llama Stack server pods
-# 2. Configure model serving endpoints
-# 3. Set up inference routes
-# 4. Connect to OpenShift AI workbenches
-# 5. Verify model serving capabilities
+# 1. Deploy Llama Stack server pods as documented
+# 2. Configure model serving endpoints per the guide
+# 3. Set up inference routes exactly as specified
+# 4. Connect to OpenShift AI workbenches following instructions
+# 5. Verify model serving capabilities using documented procedures
+# 6. STOP and ask for user guidance if any deviation is needed
 ```
 
 ##### 4. **Agentic AI Demo**
@@ -136,15 +153,20 @@ Use the instructions in 'ROSA Cluster creation agent instructions.md'"
 
 **Usage with AI Assistant**:
 ```bash
-"Deploy the agentic AI demo from rhai-agentic-demo/ on my ROSA cluster"
+"Deploy the agentic AI demo from rhai-agentic-demo/ on my ROSA cluster
+
+IMPORTANT: Strictly follow the instructions in the rhai-agentic-demo documentation. 
+Do not deviate or use alternative methods. If you encounter any situation requiring 
+deviation, stop and ask me for guidance before proceeding."
 
 # The AI assistant will:
-# 1. Deploy PostgreSQL database with sample CRM data
-# 2. Deploy MCP servers (CRM, PDF, Slack)
-# 3. Deploy Llama Stack for LLM inference
-# 4. Deploy UI application
-# 5. Configure networking and routes
+# 1. Deploy PostgreSQL database with sample CRM data as documented
+# 2. Deploy MCP servers (CRM, PDF, Slack) per the instructions
+# 3. Deploy Llama Stack for LLM inference following the guide
+# 4. Deploy UI application exactly as specified
+# 5. Configure networking and routes according to documentation
 # 6. Provide access URLs and usage instructions
+# 7. STOP and ask for user guidance if any deviation is needed
 ```
 
 #### 🚀 Complete End-to-End Deployment with AI Assistant
@@ -157,7 +179,11 @@ Here's how to deploy the entire stack using an AI code assistant like Cursor:
 "Set up my environment for ROSA deployment:
 1. Verify AWS CLI is configured with account 371594374265
 2. Verify ROSA CLI is installed and authenticated
-3. Check prerequisites using 'ROSA Cluster creation agent instructions.md'"
+3. Check prerequisites using 'ROSA Cluster creation agent instructions.md'
+
+IMPORTANT: Follow the documented prerequisites exactly. Do not skip steps 
+or use shortcuts. If any prerequisite check fails, stop and ask me for 
+guidance before proceeding."
 ```
 
 **Step 2: Create ROSA Cluster**
@@ -167,24 +193,40 @@ Here's how to deploy the entire stack using an AI code assistant like Cursor:
 - Region: Singapore (ap-southeast-1)
 - Worker nodes: 3 x m5.4xlarge
 - Network: Public API and ingress
-- Use the agent instructions for deployment"
+- Use the agent instructions for deployment
+
+IMPORTANT: Strictly follow the deployment instructions in 'ROSA Cluster 
+creation agent instructions.md'. Do not deviate or fall back to alternative 
+methods. If any error occurs or deviation is needed, stop and ask me for 
+guidance before proceeding."
 ```
 
 **Step 3: Deploy OpenShift AI**
 ```bash
 "Now deploy OpenShift AI on the ai-demo-cluster following 
-the OpenShift AI setup.md guide"
+the OpenShift AI setup.md guide
+
+IMPORTANT: Strictly follow the OpenShift AI setup.md instructions. Do not 
+deviate or use alternative deployment methods. If any issues arise, stop 
+and ask me for guidance."
 ```
 
 **Step 4: Deploy Llama Stack**
 ```bash
-"Deploy Llama Stack using the Llama Stack OpenShift AI Integration Guide"
+"Deploy Llama Stack using the Llama Stack OpenShift AI Integration Guide
+
+IMPORTANT: Strictly follow the Llama Stack integration guide. Do not deviate 
+or use alternative methods. If any issues arise, stop and ask me for guidance."
 ```
 
 **Step 5: Deploy Agentic AI Demo**
 ```bash
 "Deploy the complete agentic AI demo from rhai-agentic-demo/ 
-including all MCP servers, database, and UI"
+including all MCP servers, database, and UI
+
+IMPORTANT: Strictly follow the rhai-agentic-demo deployment documentation. 
+Do not deviate or use shortcuts. If any issues arise, stop and ask me for 
+guidance."
 ```
 
 #### 📊 What Gets Deployed Automatically
