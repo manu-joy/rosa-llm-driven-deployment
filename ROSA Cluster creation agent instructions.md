@@ -496,6 +496,34 @@ rosa create ocm-role --mode auto --yes --region {aws-region}
 rosa list ocm-roles
 ```
 
+#### **Step 6a: User Role Setup**
+**CRITICAL**: Create user role for your Red Hat account user to create clusters.
+
+**Check if User Role Exists**:
+```bash
+# Check for existing user roles
+rosa list user-role --region {aws-region}
+```
+
+**Create User Role if Missing**:
+```bash
+# Create user role for your Red Hat account
+rosa create user-role --mode auto --yes --region {aws-region}
+
+# This creates: ManagedOpenShift-User-{username}-Role
+# Automatically links to your Red Hat account ID
+```
+
+**Verification**:
+```bash
+# List user roles
+rosa list user-role --region {aws-region}
+
+# Verify in AWS Console
+# Navigate to: https://console.aws.amazon.com/iam/home#/roles
+# Look for: ManagedOpenShift-User-{username}-Role
+```
+
 #### **Step 7: Create VPC and Networking (HCP Clusters Only)**
 **CRITICAL**: For ROSA HCP clusters, create VPC and networking components.
 
@@ -526,7 +554,7 @@ aws ec2 describe-vpcs --region {aws-region} --filters "Name=tag:Name,Values=*ros
 aws ec2 describe-subnets --region {aws-region} --filters "Name=tag:Name,Values=*rosa*"
 ```
 
-### **Billing Account Setup (REQUIRED EIGHTH - HCP Only)**
+### **Step 8: Billing Account Setup (REQUIRED - HCP Only)**
 **CRITICAL**: ROSA HCP requires a billing account linked to your Red Hat account.
 
 **Prerequisites**: 
