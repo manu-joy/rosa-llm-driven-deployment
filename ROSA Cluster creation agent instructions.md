@@ -315,6 +315,37 @@ Use these rules first. If any constraint is missing, search official docs and re
    - If user says "create ROSA HCP cluster" → Deploy HCP (explicit confirmation)
 7. **Any prerequisite failure = STOP deployment until resolved**
 8. **Any parameter validation failure = ASK user for correction**
+9. **⚠️ NEVER provide final deployment summary until cluster is fully ready and admin credentials are created**
+
+#### **📋 DEPLOYMENT SUMMARY TIMING - STRICT REQUIREMENT**
+
+**WAIT for ALL of these conditions before providing final summary:**
+- ✅ Cluster state = "ready" (not "installing", "validating", or "pending")
+- ✅ API URL is available and populated
+- ✅ Console URL is available and populated
+- ✅ Admin user credentials have been created using `rosa create admin`
+- ✅ Worker nodes are provisioned (current count matches desired count)
+
+**While cluster is installing:**
+- Provide brief progress updates every 30-60 seconds
+- Show current state (e.g., "installing", "validating")
+- Inform user that full summary will be provided once ready
+- Do NOT create comprehensive deployment summary document yet
+
+**Example of what to show while installing:**
+```
+⏳ Cluster Status Update
+- State: installing
+- Progress: Control plane provisioning in progress
+- Time elapsed: 5 minutes
+- Expected completion: 5-10 minutes remaining
+```
+
+**Only after cluster is ready:**
+- Create admin user
+- Retrieve all URLs and credentials
+- Provide comprehensive deployment summary
+- Create deployment documentation file
 
 #### **🛑 EMERGENCY STOP CONDITIONS**
 
@@ -332,6 +363,7 @@ Use these rules first. If any constraint is missing, search official docs and re
 - Skip prerequisites or error handling steps
 - Continue deployment with partial failures
 - Lose deployment context during error handling
+- **Provide final summary while cluster is still installing**
 
 ---
 
@@ -819,6 +851,13 @@ rosa create cluster --cluster-name {cluster-name} \
 5. **ALWAYS** use HCP-specific installer roles when creating operator roles for HCP clusters.
 
 #### **Cluster Creation Step 6: Monitor Installation Progress**
+
+**⚠️ CRITICAL WORKFLOW REQUIREMENT:**
+- **DO NOT** provide final deployment summary while cluster is installing
+- **WAIT** for cluster state to reach "ready" before creating admin user
+- **ONLY AFTER** cluster is ready and admin user is created, provide comprehensive summary
+
+**Monitoring Commands:**
 ```bash
 # Check cluster status
 rosa describe cluster -c {cluster-name} --region {aws-region}
@@ -836,10 +875,51 @@ rosa describe cluster -c {cluster-name} --region {aws-region} | grep -E "State:|
 **Installation Progress Stages:**
 1. `validating` - Initial validation of configuration
 2. `pending (Preparing account)` - Setting up account resources
-3. `installing` - Creating infrastructure and control plane
-4. `ready` - Cluster is ready for use
+3. `installing` - Creating infrastructure and control plane ⏳ **WAIT HERE**
+4. `ready` - Cluster is ready for use ✅ **PROCEED TO STEP 7**
 
 **Typical Installation Time**: 10-15 minutes for HCP clusters
+
+**What to do while installing:**
+- Monitor state every 30-60 seconds
+- Provide brief status updates to user
+- Do NOT create deployment summary yet
+- Wait patiently for "ready" state
+
+#### **Cluster Creation Step 7: Create Admin User (ONLY After Cluster is Ready)**
+
+**Pre-requisites:**
+- ✅ Cluster state must be "ready"
+- ✅ API URL and Console URL must be available
+
+```bash
+# Wait for cluster to be ready
+while true; do
+  STATE=$(rosa describe cluster -c {cluster-name} --region {aws-region} | grep "State:" | awk '{print $2}')
+  if [[ "$STATE" == "ready" ]]; then
+    echo "✅ Cluster is ready!"
+    break
+  fi
+  echo "⏳ Current state: $STATE - waiting..."
+  sleep 30
+done
+
+# Create admin user (ONLY after cluster is ready)
+rosa create admin --cluster {cluster-name} --region {aws-region}
+
+# Save the output with username and password
+```
+
+#### **Cluster Creation Step 8: Provide Final Deployment Summary**
+
+**Only after completing Steps 1-7**, provide the comprehensive deployment summary with:
+- ✅ Cluster details
+- ✅ Admin username and password
+- ✅ API URL and Console URL
+- ✅ Network infrastructure details
+- ✅ IAM roles and ARNs
+- ✅ Login instructions
+- ✅ Management commands
 
 ### **TROUBLESHOOTING COMMON ISSUES**
 
@@ -1095,21 +1175,80 @@ oc get nodes
 
 ## 🔐 Post-Creation Outputs & Handover
 
-### Retrieve Credentials
-```bash
-# For Terraform deployments
-terraform output cluster_admin_username
-terraform output cluster_admin_password
-terraform output cluster_api_url
-terraform output cluster_console_url
+### ⚠️ CRITICAL: Wait for Cluster Ready State
 
-# For CLI deployments
-rosa describe cluster <cluster-name>
+**DO NOT provide the final deployment summary until ALL of the following are completed:**
+
+1. ✅ **Cluster State = "ready"**
+   ```bash
+   rosa describe cluster <cluster-name> | grep "State:" | grep "ready"
+   ```
+
+2. ✅ **API URL and Console URL are available**
+   ```bash
+   rosa describe cluster <cluster-name> | grep -E "API URL:|Console URL:"
+   ```
+
+3. ✅ **Worker nodes are provisioned**
+   ```bash
+   rosa describe cluster <cluster-name> | grep "Compute (current):"
+   # Should match the desired count
+   ```
+
+4. ✅ **Admin credentials created**
+   ```bash
+   rosa create admin --cluster <cluster-name>
+   # Successfully returns username and password
+   ```
+
+### Monitoring Until Ready
+
+**While cluster is installing:**
+- Monitor cluster state every 30-60 seconds
+- Provide brief status updates to user
+- Wait for "State: ready" before proceeding
+- Typical HCP installation time: 10-15 minutes
+
+**Example monitoring loop:**
+```bash
+while true; do
+  STATE=$(rosa describe cluster <cluster-name> | grep "State:" | awk '{print $2}')
+  echo "Current state: $STATE"
+  if [[ "$STATE" == "ready" ]]; then
+    echo "Cluster is ready!"
+    break
+  fi
+  sleep 30
+done
+```
+
+### Retrieve Credentials (Only After Cluster is Ready)
+
+**Create Admin User:**
+```bash
+# For CLI deployments - create admin user after cluster is ready
+rosa create admin --cluster <cluster-name>
+
+# This will output:
+# W: It is recommended to add an identity provider to login to this cluster. See 'rosa create idp --help' for more information.
+# INFO: Admin account has been added to cluster '<cluster-name>'.
+# INFO: Please securely store this generated password. If you lose this password you can delete and recreate the cluster admin user.
+# INFO: To login, run the following command:
+# 
+#    oc login https://api.<cluster-domain>:443 --username cluster-admin --password <generated-password>
+# 
+# INFO: It may take up to a minute for the account to become active.
+```
+
+**Get Cluster URLs:**
+```bash
+# Get API and Console URLs
+rosa describe cluster <cluster-name> | grep -E "API URL:|Console URL:"
 ```
 
 ### Comprehensive Resource Inventory
 
-Provide the user with a complete inventory of all created resources:
+**Only after cluster is ready and admin credentials are created**, provide the user with a complete inventory of all created resources:
 
 #### Core Cluster Resources
 ```bash
