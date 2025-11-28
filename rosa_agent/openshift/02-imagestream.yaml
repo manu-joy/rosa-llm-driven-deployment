@@ -1,0 +1,10 @@
+apiVersion: image.openshift.io/v1
+kind: ImageStream
+metadata:
+  name: rosa-agent
+  namespace: aiagentforrosa
+  labels:
+    app: rosa-agent
+spec:
+  lookupPolicy:
+    local: true

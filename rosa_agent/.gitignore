@@ -1,0 +1,35 @@
+# Ignore Python cache and virtual environments
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+ENV/
+
+# Ignore environment variables
+.env
+.env.local
+
+# Ignore settings file (contains API keys)
+backend/settings.json
+
+# Ignore storage directory
+storage/
+
+# Ignore Docker volumes
+.docker/
+
+# Ignore IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Ignore logs
+*.log
+
+# Ignore OS files
+.DS_Store
+Thumbs.db

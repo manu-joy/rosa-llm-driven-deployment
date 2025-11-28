@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ROSA AI Agent</title>
+    <link rel="stylesheet" href="style.css">
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
+</head>
+
+<body>
+    <header class="header">
+        <h1>🚀 ROSA AI Agent</h1>
+        <div class="header-actions">
+            <button id="clearBtn" class="btn btn-secondary">Clear Chat</button>
+            <a href="settings.html" class="btn btn-secondary">⚙️ Settings</a>
+        </div>
+    </header>
+
+    <div class="container">
+        <!-- Split pane wrapper -->
+        <div class="split-pane">
+            <!-- Left: Chat (60%) -->
+            <div class="chat-panel">
+                <div class="chat-container">
+                    <div id="messages" class="messages-container">
+                        <div class="welcome">
+                            <h2>Welcome to ROSA AI Agent</h2>
+                            <p>Your expert assistant for Red Hat OpenShift Service on AWS</p>
+                            <p style="margin-top: 1rem; font-size: 0.9rem;">Ask me anything about ROSA cluster
+                                deployment, CLI commands, or troubleshooting!</p>
+                        </div>
+                    </div>
+                    <div class="input-container">
+                        <div class="input-wrapper">
+                            <textarea id="messageInput"
+                                placeholder="Ask me about ROSA deployment, CLI commands, or best practices..."
+                                rows="1"></textarea>
+                        </div>
+                        <button id="sendBtn" class="btn btn-primary">Send</button>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Right: Terminal (40%) -->
+            <div class="terminal-panel">
+                <div class="terminal-header">
+                    <span class="terminal-title">📟 Terminal Output</span>
+                    <button id="clearTerminal" class="terminal-clear-btn">Clear</button>
+                </div>
+                <div id="terminal" class="terminal-content">
+                    <div class="terminal-line terminal-info">Terminal ready. CLI execution output will appear here.
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="app.js"></script>
+</body>
+
+</html>
