@@ -30,7 +30,7 @@
                             <option value="groq">Groq (Fast & Free)</option>
                             <option value="openai">OpenAI (GPT-4, GPT-3.5)</option>
                             <option value="anthropic">Anthropic (Claude)</option>
-                            <option value="local">Local Model (Ollama/vLLM)</option>
+                            <option value="local">Custom / Self-Hosted (vLLM, Ollama)</option>
                         </select>
                     </div>
 
@@ -87,18 +87,22 @@
                         </div>
                     </div>
 
-                    <!-- Local Config -->
+                    <!-- Local/Custom Config -->
                     <div id="localConfig" class="provider-config" style="display: none;">
                         <div class="form-group">
                             <label for="localEndpoint">Endpoint URL</label>
-                            <input type="text" id="localEndpoint" placeholder="http://localhost:11434">
+                            <input type="text" id="localEndpoint" placeholder="https://your-model-endpoint.com/v1">
                             <small style="color: var(--text-secondary); display: block; margin-top: 0.5rem;">
-                                OpenAI-compatible API endpoint (e.g., Ollama, vLLM, LM Studio)
+                                OpenAI-compatible API endpoint (e.g., vLLM, Ollama, LM Studio)
                             </small>
                         </div>
                         <div class="form-group">
+                            <label for="localApiKey">API Key (Optional)</label>
+                            <input type="password" id="localApiKey" placeholder="Enter API key if required">
+                        </div>
+                        <div class="form-group">
                             <label for="localModel">Model Name</label>
-                            <input type="text" id="localModel" placeholder="llama2">
+                            <input type="text" id="localModel" placeholder="e.g., mistral-7b, gpt-oss-20b">
                         </div>
                     </div>
 

@@ -61,6 +61,7 @@ async function loadSettings() {
                 document.getElementById('anthropicModel').value = config.model || 'claude-3-sonnet-20240229';
             } else if (data.provider === 'local') {
                 document.getElementById('localEndpoint').value = config.endpoint_url || '';
+                document.getElementById('localApiKey').value = config.api_key || '';
                 document.getElementById('localModel').value = config.model || 'llama2';
             }
         }
@@ -95,6 +96,7 @@ settingsForm.addEventListener('submit', async function (e) {
     } else if (provider === 'local') {
         config = {
             endpoint_url: document.getElementById('localEndpoint').value,
+            api_key: document.getElementById('localApiKey').value,
             model: document.getElementById('localModel').value
         };
     }
@@ -164,6 +166,7 @@ testBtn.addEventListener('click', async function () {
     } else if (provider === 'local') {
         config = {
             endpoint_url: document.getElementById('localEndpoint').value,
+            api_key: document.getElementById('localApiKey').value,
             model: document.getElementById('localModel').value
         };
     }

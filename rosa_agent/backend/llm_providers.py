@@ -76,14 +76,29 @@ class GroqProvider(LLMProvider):
                 "temperature": kwargs.get('temperature', 0.7),
                 "max_tokens": kwargs.get('max_tokens', 2000)
             }
-            response = requests.post(
-                f"{self.base_url}/chat/completions",
-                json=payload,
-                headers=headers,
-                timeout=60
-            )
-            response.raise_for_status()
-            return response.json()['choices'][0]['message']['content']
+            # Retry logic for rate limits
+            max_retries = 3
+            base_delay = 2
+            
+            for attempt in range(max_retries + 1):
+                try:
+                    response = requests.post(
+                        f"{self.base_url}/chat/completions",
+                        json=payload,
+                        headers=headers,
+                        timeout=60
+                    )
+                    response.raise_for_status()
+                    return response.json()['choices'][0]['message']['content']
+                except requests.exceptions.HTTPError as e:
+                    if e.response.status_code == 429:
+                        if attempt < max_retries:
+                            import time
+                            sleep_time = base_delay * (2 ** attempt)
+                            print(f"Groq rate limit hit, retrying in {sleep_time}s...")
+                            time.sleep(sleep_time)
+                            continue
+                    raise e
         except Exception as e:
             raise Exception(f"Groq API error: {str(e)}")
     
@@ -156,15 +171,21 @@ class AnthropicProvider(LLMProvider):
 class LocalProvider(LLMProvider):
     """Local LLM provider (Ollama, vLLM, etc.)"""
     
-    def __init__(self, endpoint_url: str, model: str = "llama2"):
+    def __init__(self, endpoint_url: str, api_key: str = None, model: str = "llama2"):
         self.endpoint_url = endpoint_url
+        self.api_key = api_key
         self.model = model
     
     def generate_response(self, messages: List[Dict[str, str]], **kwargs) -> str:
         try:
+            headers = {"Content-Type": "application/json"}
+            if self.api_key:
+                headers["Authorization"] = f"Bearer {self.api_key}"
+
             # OpenAI-compatible API format
             response = requests.post(
                 f"{self.endpoint_url}/v1/chat/completions",
+                headers=headers,
                 json={
                     "model": self.model,
                     "messages": messages,
@@ -180,8 +201,12 @@ class LocalProvider(LLMProvider):
     
     def validate_config(self) -> bool:
         try:
+            headers = {}
+            if self.api_key:
+                headers["Authorization"] = f"Bearer {self.api_key}"
+            
             # Test endpoint availability
-            response = requests.get(f"{self.endpoint_url}/v1/models", timeout=5)
+            response = requests.get(f"{self.endpoint_url}/v1/models", headers=headers, timeout=5)
             return response.status_code == 200
         except Exception:
             return False
@@ -215,6 +240,7 @@ class LLMProviderFactory:
         elif provider_type.lower() == "local":
             return LocalProvider(
                 endpoint_url=config.get('endpoint_url'),
+                api_key=config.get('api_key'),
                 model=config.get('model', 'llama2')
             )
         

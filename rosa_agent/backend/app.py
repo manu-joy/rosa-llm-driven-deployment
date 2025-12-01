@@ -28,7 +28,8 @@ cli_executor = CLIExecutor()
 current_provider = None
 
 # Settings file path
-SETTINGS_FILE = os.path.join(os.path.dirname(__file__), 'settings.json')
+# Settings file path
+SETTINGS_FILE = '/tmp/settings.json'
 
 
 def load_settings():
@@ -40,6 +41,28 @@ def load_settings():
     except Exception as e:
         logger.error(f"Error loading settings: {e}")
     
+    # Check for Local LLM env var
+    local_llm_endpoint = os.getenv('LOCAL_LLM_ENDPOINT')
+    if local_llm_endpoint:
+        return {
+            'provider': 'local',
+            'config': {
+                'endpoint_url': local_llm_endpoint,
+                'model': os.getenv('LOCAL_LLM_MODEL', 'mistral-7b-awq')
+            }
+        }
+
+    # Check for Groq env var
+    groq_api_key = os.getenv('GROQ_API_KEY')
+    if groq_api_key:
+        return {
+            'provider': 'groq',
+            'config': {
+                'api_key': groq_api_key,
+                'model': 'llama-3.1-8b-instant'
+            }
+        }
+
     # Default settings
     return {
         'provider': 'openai',
@@ -66,9 +89,10 @@ def initialize_provider():
     global current_provider
     settings = load_settings()
     
-    # Don't initialize if no API key configured
-    if not settings.get('config', {}).get('api_key'):
-        logger.info("No API key configured, skipping provider initialization")
+    # Don't initialize if no API key or endpoint configured
+    config = settings.get('config', {})
+    if not config.get('api_key') and not config.get('endpoint_url'):
+        logger.info("No API key or endpoint configured, skipping provider initialization")
         current_provider = None
         return
     
@@ -245,10 +269,35 @@ def chat():
             rosa_expert.add_to_conversation('system', context_message)
         
         # Get conversation messages with system prompt
-        messages = rosa_expert.get_conversation_messages()
+        # Use provider-specific prompt (simplified for local endpoints)
+        provider_class_name = current_provider.__class__.__name__
+        messages = rosa_expert.get_conversation_messages_for_provider(provider_class_name)
         
         # Generate response from LLM
         response = current_provider.generate_response(messages)
+        
+        # Post-process response to detect and filter JSON command outputs
+        import re
+        import json as json_module
+        
+        # Check if response looks like a JSON command structure
+        if re.search(r'\{\s*["\']cmd["\'\s]*:\s*\[', response):
+            try:
+                # Try to parse as JSON to confirm
+                json_module.loads(response)
+                # If it's valid JSON with 'cmd' key, replace with error message
+                response = """I apologize, but I encountered an issue with my response format. Let me try again.
+
+For ROSA CLI version, you can run:
+```bash
+rosa version
+```
+
+Please ask me again if you'd like me to check this for you."""
+                logger.warning("Detected and filtered JSON command output from LLM")
+            except:
+                # Not valid JSON, keep original response
+                pass
         
         # Add assistant response to conversation
         rosa_expert.add_to_conversation('assistant', response)
@@ -305,10 +354,12 @@ def get_settings():
     settings = load_settings()
     
     # Mask API keys in response
-    if 'config' in settings and 'api_key' in settings['config']:
-        api_key = settings['config']['api_key']
-        if api_key:
-            settings['config']['api_key'] = api_key[:8] + '...' + api_key[-4:] if len(api_key) > 12 else '***'
+    if 'config' in settings:
+        # Mask api_key if present (for any provider)
+        if 'api_key' in settings['config']:
+            api_key = settings['config']['api_key']
+            if api_key:
+                settings['config']['api_key'] = api_key[:8] + '...' + api_key[-4:] if len(api_key) > 12 else '***'
     
     return jsonify(settings)
 
