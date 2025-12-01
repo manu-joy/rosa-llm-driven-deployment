@@ -1,0 +1,29 @@
+# Deployment context files
+rosa-deployment-context.md
+
+# MacOS
+.DS_Store
+
+# Terraform
+*.tfstate
+*.tfstate.*
+.terraform/
+.terraform.lock.hcl
+
+# Credentials and secrets
+*.pem
+*.key
+terraform.tfvars
+!terraform.tfvars.example
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Temporary files
+*.tmp
+*.log
+

@@ -177,7 +177,7 @@ Here's how to deploy the entire stack using an AI code assistant like Cursor:
 ```bash
 # In your AI code assistant terminal:
 "Set up my environment for ROSA deployment:
-1. Verify AWS CLI is configured with account 371594374265
+1. Verify AWS CLI is configured with your AWS account
 2. Verify ROSA CLI is installed and authenticated
 3. Check prerequisites using 'ROSA Cluster creation agent instructions.md'
 

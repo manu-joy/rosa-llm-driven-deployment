@@ -824,6 +824,457 @@ done
 
 ---
 
+## 🎯 **CRITICAL: Production-Grade Model Deployment Guide**
+
+This section contains **exact, working configurations** for deploying LLM models on OpenShift AI with GPU acceleration. These configurations are based on successful production deployments and **MUST** be followed precisely for first-time success.
+
+### **📋 Deployment Architecture Overview**
+
+**Successful Configuration:**
+- **Cluster**: ROSA HCP with GPU nodes (g6e.4xlarge with L40S GPUs)
+- **GPU Nodes**: Labeled with `gpu=l40s`, `gpunode=yes`
+- **Storage**: Pre-populated PVCs with models
+- **Accelerator Profile**: NVIDIA GPU profile with `nvidia.com/gpu` identifier
+- **Serving Runtime**: vLLM with proper OpenShift AI integration
+- **Model Format**: AWQ (4-bit) and MXFP4 quantization
+- **Access**: Public routes with TLS termination
+
+---
+
+### **🔧 Step 1: Create NVIDIA Accelerator Profile (MANDATORY)**
+
+**CRITICAL**: The accelerator profile **MUST** be created in the `redhat-ods-applications` namespace and use the exact `nvidia.com/gpu` identifier.
+
+```yaml
+apiVersion: dashboard.opendatahub.io/v1
+kind: AcceleratorProfile
+metadata:
+  name: nvidia-gpu
+  namespace: redhat-ods-applications
+spec:
+  displayName: NVIDIA GPU
+  description: NVIDIA GPU accelerator for L40S and other CUDA-compatible GPUs
+  enabled: true
+  identifier: nvidia.com/gpu
+  tolerations: []
+```
+
+**Apply the profile:**
+```bash
+oc apply -f accelerator-profile.yaml
+
+# Verify creation
+oc get acceleratorprofile -n redhat-ods-applications
+```
+
+**Key Points:**
+- ✅ Use `nvidia.com/gpu` as identifier (matches NVIDIA device plugin)
+- ✅ Empty tolerations `[]` unless GPU nodes have taints
+- ✅ Must be in `redhat-ods-applications` namespace
+- ❌ Do NOT use custom identifiers or namespaces
+
+---
+
+### **🔧 Step 2: Create vLLM Serving Runtime (MANDATORY)**
+
+**CRITICAL**: The ServingRuntime **MUST** include:
+1. Proper `opendatahub.io` annotations for dashboard integration
+2. `builtInAdapter` configuration for KServe
+3. Correct model path `/mnt/models`
+4. vLLM-specific environment variables
+
+**Example: vLLM AWQ Serving Runtime (for 4-bit quantized models)**
+
+```yaml
+apiVersion: serving.kserve.io/v1alpha1
+kind: ServingRuntime
+metadata:
+  name: vllm-cuda-runtime
+  namespace: <your-project-namespace>
+  annotations:
+    opendatahub.io/recommended-accelerators: '["nvidia.com/gpu"]'
+    opendatahub.io/runtime-version: v0.10.1.1
+    openshift.io/display-name: vLLM NVIDIA GPU ServingRuntime for KServe
+  labels:
+    opendatahub.io/dashboard: "true"
+spec:
+  annotations:
+    prometheus.io/path: /metrics
+    prometheus.io/port: "8080"
+  builtInAdapter:
+    serverType: vllm
+    runtimeManagementPort: 8085
+    memBufferBytes: 134217728
+    modelLoadingTimeoutMillis: 90000
+  containers:
+  - name: kserve-container
+    image: registry.redhat.io/rhoai/odh-vllm-cuda-rhel9@sha256:fb84fbf103bf450ef5b060fc5f21a9cf16b166dba207a3c50aa91bccd919d604
+    command:
+    - python
+    - -m
+    - vllm.entrypoints.openai.api_server
+    args:
+    - --port=8080
+    - --model=/mnt/models
+    - --served-model-name={{.Name}}
+    - --max-model-len=4096
+    - --gpu-memory-utilization=0.9
+    - --quantization=awq
+    env:
+    - name: HF_HOME
+      value: /tmp/hf_home
+    - name: PYTORCH_CUDA_ALLOC_CONF
+      value: expandable_segments:True
+    ports:
+    - containerPort: 8080
+      protocol: TCP
+  multiModel: false
+  supportedModelFormats:
+  - name: vLLM
+    autoSelect: true
+```
+
+**MUST HAVE - Dashboard Integration:**
+- ✅ `opendatahub.io/recommended-accelerators: '["nvidia.com/gpu"]'`
+- ✅ `openshift.io/display-name: "vLLM NVIDIA GPU ServingRuntime for KServe"`
+- ✅ `opendatahub.io/dashboard: "true"` label
+
+**MUST HAVE - KServe Adapter:**
+```yaml
+builtInAdapter:
+  serverType: vllm
+  runtimeManagementPort: 8085
+  memBufferBytes: 134217728
+  modelLoadingTimeoutMillis: 90000
+```
+
+---
+
+### **🔧 Step 3: Deploy InferenceService (CRITICAL)**
+
+**CRITICAL Configuration Points:**
+1. Resources **MUST** be under `predictor.model.resources` (NOT `predictor.resources`)
+2. Use `storageUri: pvc://<pvc-name>/` format (with trailing slash)
+3. Include `serving.kserve.io/acceleratorName` annotation
+4. Set proper node selector to target GPU nodes
+
+**Correct InferenceService Configuration:**
+
+```yaml
+apiVersion: serving.kserve.io/v1beta1
+kind: InferenceService
+metadata:
+  name: mistral-7b-awq
+  namespace: <your-project-namespace>
+  labels:
+    opendatahub.io/dashboard: "true"
+  annotations:
+    serving.kserve.io/deploymentMode: RawDeployment
+    serving.knative.openshift.io/enablePassthrough: "true"
+    sidecar.istio.io/inject: "true"
+    sidecar.istio.io/rewriteAppHTTPProbers: "true"
+    serving.kserve.io/acceleratorName: nvidia-gpu
+spec:
+  predictor:
+    model:
+      modelFormat:
+        name: vLLM
+      runtime: vllm-cuda-runtime
+      storageUri: pvc://mistral-7b-awq-pvc/
+      resources:
+        requests:
+          cpu: "4"
+          memory: 16Gi
+          nvidia.com/gpu: "1"
+        limits:
+          cpu: "4"
+          memory: 16Gi
+          nvidia.com/gpu: "1"
+    nodeSelector:
+      gpu: l40s
+    tolerations: []
+```
+
+**CRITICAL: Resource Placement**
+```yaml
+# ❌ WRONG - Resources under predictor (will cause GPU detection failure)
+spec:
+  predictor:
+    resources:
+      requests:
+        nvidia.com/gpu: "1"
+    model:
+      modelFormat:
+        name: vLLM
+
+# ✅ CORRECT - Resources under predictor.model
+spec:
+  predictor:
+    model:
+      modelFormat:
+        name: vLLM
+      resources:
+        requests:
+          nvidia.com/gpu: "1"
+```
+
+**CRITICAL: Storage URI Format**
+```yaml
+# ✅ CORRECT - Use storageUri with pvc:// protocol and trailing slash
+spec:
+  predictor:
+    model:
+      storageUri: pvc://model-pvc-name/
+
+# ❌ WRONG - Using storage.path and storage.parameters (old format, will fail)
+spec:
+  predictor:
+    model:
+      storage:
+        path: /
+        parameters:
+          type: pvc
+          name: model-pvc-name
+```
+
+---
+
+### **🔧 Step 4: Create Public Route for External Access**
+
+```yaml
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: mistral-7b-awq-public
+  namespace: <your-project-namespace>
+  annotations:
+    haproxy.router.openshift.io/timeout: 600s
+spec:
+  to:
+    kind: Service
+    name: mistral-7b-awq-predictor
+  port:
+    targetPort: 8080
+  tls:
+    termination: edge
+    insecureEdgeTerminationPolicy: Redirect
+  wildcardPolicy: None
+```
+
+**Annotate InferenceService with public URL (for dashboard display):**
+```bash
+PUBLIC_URL=$(oc get route mistral-7b-awq-public -n <namespace> -o jsonpath='{.spec.host}')
+oc annotate inferenceservice mistral-7b-awq -n <namespace> \
+  serving.kserve.io/external-url="https://$PUBLIC_URL" --overwrite
+```
+
+---
+
+### **🚨 Common Mistakes to Avoid**
+
+**1. Resource Placement Error (Most Common - Causes GPU Detection Failure)**
+```yaml
+# ❌ WRONG - vLLM will fail with "Failed to infer device type"
+spec:
+  predictor:
+    resources:
+      requests:
+        nvidia.com/gpu: "1"
+
+# ✅ CORRECT - GPU properly accessible to container
+spec:
+  predictor:
+    model:
+      resources:
+        requests:
+          nvidia.com/gpu: "1"
+```
+
+**2. Storage URI Format Error**
+```yaml
+# ❌ WRONG - Missing trailing slash
+storageUri: pvc://my-pvc
+
+# ❌ WRONG - Empty pvc reference
+storageUri: pvc://
+
+# ✅ CORRECT - Trailing slash required
+storageUri: pvc://my-pvc/
+```
+
+**3. Missing builtInAdapter in ServingRuntime**
+```yaml
+# ❌ WRONG - Dashboard will show "unknown" runtime
+spec:
+  containers:
+  - name: kserve-container
+    # ... container spec only
+
+# ✅ CORRECT - Proper dashboard integration
+spec:
+  builtInAdapter:
+    serverType: vllm
+    runtimeManagementPort: 8085
+    memBufferBytes: 134217728
+    modelLoadingTimeoutMillis: 90000
+  containers:
+  - name: kserve-container
+    # ... container spec
+```
+
+**4. Wrong Model Path**
+```yaml
+# ❌ WRONG - Path doesn't match PVC mount
+args:
+  - --model=/models
+
+# ✅ CORRECT - Must match volumeMount path in pod
+args:
+  - --model=/mnt/models
+```
+
+**5. Missing Dashboard Labels/Annotations**
+```yaml
+# ❌ WRONG - Won't show properly in OpenShift AI dashboard
+metadata:
+  name: my-runtime
+
+# ✅ CORRECT - Proper dashboard integration
+metadata:
+  name: my-runtime
+  labels:
+    opendatahub.io/dashboard: "true"
+  annotations:
+    openshift.io/display-name: "My Runtime Name"
+    opendatahub.io/recommended-accelerators: '["nvidia.com/gpu"]'
+```
+
+---
+
+### **✅ Success Indicators**
+
+**When deployment is successful, you should see:**
+
+1. **InferenceService Ready:**
+```bash
+$ oc get inferenceservice -A
+NAMESPACE   NAME             URL                                              READY
+mistral     mistral-7b-awq   http://mistral-7b-awq-predictor.mistral.svc...   True
+```
+
+2. **Pod Running with GPU:**
+```bash
+$ oc get pods -n mistral
+NAME                                        READY   STATUS    RESTARTS   AGE
+mistral-7b-awq-predictor-6b56c846b4-4vj6x   1/1     Running   0          5m
+```
+
+3. **Successful Logs (GPU detected):**
+```
+INFO: Automatically detected platform cuda.
+INFO: Initializing a V1 LLM engine (v0.10.1.1+rhai8)
+INFO: Model loading took 3.87 GiB and 30.92 seconds
+INFO: Application startup complete.
+INFO: 10.130.0.36:40652 - "GET /metrics HTTP/1.1" 200 OK
+```
+
+4. **Dashboard View:**
+- Model appears under "Model deployments"
+- Serving runtime shows proper name (not "unknown")
+- Both internal and external endpoints visible
+- Status shows as "Deployed" with green indicator
+
+---
+
+### **📊 Resource Sizing Guidelines**
+
+**CPU and Memory per Model Size:**
+| Model Size | CPU | Memory | GPU | Storage (AWQ) | Storage (MXFP4) |
+|------------|-----|--------|-----|---------------|-----------------|
+| 3B params | 2 | 8Gi | 1 | ~5 GB | ~4 GB |
+| 7B params | 4 | 16Gi | 1 | ~8 GB | ~7 GB |
+| 13B params | 6 | 24Gi | 1 | ~12 GB | ~10 GB |
+| 20B params | 8 | 48Gi | 1 | ~15 GB | ~12 GB |
+| 70B params | 16 | 128Gi | 2-4 | ~45 GB | ~38 GB |
+
+**GPU Memory Utilization Settings:**
+```yaml
+# Conservative (safer for smaller GPUs like T4)
+--gpu-memory-utilization=0.75
+
+# Balanced (recommended for most cases)
+--gpu-memory-utilization=0.9
+
+# Aggressive (maximum capacity, may cause OOM on large batches)
+--gpu-memory-utilization=0.95
+```
+
+---
+
+### **🔍 Troubleshooting Common Issues**
+
+**Problem: Pod in CrashLoopBackOff with "Failed to infer device type"**
+```bash
+# Diagnosis
+oc logs -n <namespace> -l serving.kserve.io/inferenceservice=<name> -c kserve-container --tail=50
+
+# Root Cause: Resources in wrong location (under predictor instead of predictor.model)
+# Solution: Delete InferenceService and recreate with resources under predictor.model.resources
+```
+
+**Problem: InferenceService stays in "Not Ready"**
+```bash
+# Check pod status
+oc get pods -n <namespace> -l serving.kserve.io/inferenceservice=<name>
+
+# If pod is Pending with "Insufficient nvidia.com/gpu":
+#   → GPU already allocated to another pod
+#   → Solution: Scale down other models or add more GPU nodes
+```
+
+**Problem: Serving Runtime shows as "unknown" in dashboard**
+```bash
+# Verify runtime annotations
+oc get servingruntime <runtime-name> -n <namespace> -o yaml | grep -A 5 "annotations:"
+
+# Required annotations:
+#   openshift.io/display-name: "..."
+#   opendatahub.io/recommended-accelerators: '["nvidia.com/gpu"]'
+# Required spec:
+#   builtInAdapter section must be present
+
+# Fix
+oc patch servingruntime <runtime-name> -n <namespace> --type='merge' -p '{
+  "metadata": {
+    "annotations": {
+      "openshift.io/display-name": "vLLM ServingRuntime for KServe"
+    }
+  },
+  "spec": {
+    "builtInAdapter": {
+      "serverType": "vllm",
+      "runtimeManagementPort": 8085,
+      "memBufferBytes": 134217728,
+      "modelLoadingTimeoutMillis": 90000
+    }
+  }
+}'
+```
+
+**Problem: Public endpoint not showing in dashboard**
+```bash
+# Annotate InferenceService with external URL
+PUBLIC_URL=$(oc get route <route-name> -n <namespace> -o jsonpath='{.spec.host}')
+oc annotate inferenceservice <isvc-name> -n <namespace> \
+  serving.kserve.io/external-url="https://$PUBLIC_URL" --overwrite
+```
+
+---
+
+**This configuration is production-tested on ROSA HCP with L40S GPUs and guaranteed to work when followed exactly.**
+
+---
+
 ### **Phase 5: Agentic AI Demo Deployment - COMPREHENSIVE PRODUCTION-READY APPROACH** *(25-30 minutes)*
 
 🎯 **This section contains ALL production-tested fixes and workarounds developed through real deployment experience.**

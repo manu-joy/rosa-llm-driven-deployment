@@ -432,6 +432,145 @@ aws service-quotas get-service-quota --service-code vpc --quota-code L-F678F1CE 
 
 ---
 
+### **AWS Account Linking (REQUIRED - New AWS Accounts)**
+
+#### **Step 3a: Link AWS Account to Red Hat Account**
+**CRITICAL**: For new AWS accounts, you must link your AWS Account ID to your Red Hat account before you can associate it with a billing account. ROSA cluster deployments use AWS Security Token Service (STS) for added security.
+
+**Prerequisites**: 
+- ✅ AWS CLI authenticated with your AWS account
+- ✅ ROSA CLI authenticated with your Red Hat account
+- ✅ AWS Account ID available (get it via `aws sts get-caller-identity`)
+
+---
+
+**Step 3a.1: Check and Create OCM Role**
+
+First, check if an OCM (OpenShift Cluster Manager) role exists and is linked:
+
+```bash
+# Check for existing OCM role
+rosa list ocm-role
+```
+
+**ℹ️ Info**: If there is an existing role and it's already linked to your Red Hat account, you can skip to Step 3a.2.
+
+**If No OCM Role Exists or Existing Role Isn't Linked:**
+
+**Option A: Create Basic OCM Role**
+```bash
+# Create basic OCM role (standard permissions)
+rosa create ocm-role
+```
+
+**Option B: Create Admin OCM Role (Recommended)**
+```bash
+# Create admin OCM role (full permissions)
+rosa create ocm-role --admin
+```
+
+**Option C: Link Existing OCM Role**
+```bash
+# If role exists but isn't linked, link it
+rosa link ocm-role --role-arn <ocm-role-arn>
+```
+
+**Verification**:
+```bash
+# Verify OCM role is created and linked
+rosa list ocm-role
+# Should show role with "Linked: Yes"
+```
+
+---
+
+**Step 3a.2: Check and Create User Role**
+
+Check if a user role exists and is linked:
+
+```bash
+# Check for existing user role
+rosa list user-role
+```
+
+**ℹ️ Info**: If there is an existing role and it's already linked to your Red Hat account, you can skip to Step 3a.3.
+
+**If No User Role Exists or Existing Role Isn't Linked:**
+
+**Create User Role:**
+```bash
+# Create user role for your Red Hat account
+rosa create user-role
+```
+
+**Link Existing User Role:**
+```bash
+# If role exists but isn't linked, link it
+rosa link user-role --role-arn <user-role-arn>
+```
+
+**Verification**:
+```bash
+# Verify user role is created and linked
+rosa list user-role
+# Should show role with "Linked: Yes"
+```
+
+---
+
+**Step 3a.3: Create Account-Wide Roles (HCP)**
+
+Create the necessary account-wide roles and policies for ROSA HCP clusters:
+
+```bash
+# Create account roles for HCP clusters using auto mode
+rosa create account-roles --hosted-cp --mode auto --yes
+
+# For specific region (recommended)
+rosa create account-roles --hosted-cp --mode auto --yes --region {aws-region}
+```
+
+**This creates the following roles:**
+- `ManagedOpenShift-HCP-ROSA-Installer-Role`
+- `ManagedOpenShift-HCP-ROSA-Support-Role`
+- `ManagedOpenShift-HCP-ROSA-Worker-Role`
+
+**Verification**:
+```bash
+# List created account roles
+rosa list account-roles
+
+# Verify in AWS Console
+# Navigate to: https://console.aws.amazon.com/iam/home#/roles
+# Look for: ManagedOpenShift-HCP-ROSA-* roles
+```
+
+---
+
+**Step 3a.4: Verify AWS Account Linking**
+
+Verify your AWS account is properly linked to your Red Hat account:
+
+```bash
+# Check account linkage
+rosa whoami
+
+# Verify permissions
+rosa verify permissions
+```
+
+**Expected Output**: Should show your AWS Account ID, Red Hat account details, and OCM organization information.
+
+**⚠️ Important Notes:**
+- These steps are **REQUIRED** for new AWS accounts before you can set up billing
+- OCM role and User role must be created and linked before proceeding to billing setup
+- Account roles are required before creating any ROSA clusters
+- This is a **one-time setup per AWS account**
+
+**Reference**: [ROSA AWS Prerequisites Documentation](https://docs.openshift.com/rosa/rosa_getting_started/rosa-aws-prereqs.html)
+
+---
+
 ### **ROSA Prerequisites (REQUIRED FOURTH - Complete After AWS Prerequisites)**
 
 #### **Step 4: ROSA CLI Login and Authentication**
