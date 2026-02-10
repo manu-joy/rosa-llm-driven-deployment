@@ -18,6 +18,24 @@
 
 ---
 
+## Table of Contents
+
+- [TL;DR](#tldr)
+- [The AI Inference Challenge](#the-ai-inference-challenge-a-250-billion-problem)
+- [Why Inference Is the Battleground](#why-inference-is-the-battleground-breaking-free-from-nvidia-dependency)
+- [Enter AWS Inferentia2](#enter-aws-inferentia2)
+- [Red Hat and AWS Bring Neuron Support to OpenShift](#what-changed-red-hat-and-aws-bring-neuron-support-to-openshift)
+- [Real-World Validation: What I Measured](#real-world-validation-what-i-measured)
+- [Deployment Architecture & Step-by-Step Guide](#how-it-works-deployment-architecture)
+- [The Economics: GPU vs. Inferentia2](#the-economics-gpu-vs-inferentia2)
+- [Getting Started](#getting-started)
+- [Conclusion](#conclusion)
+- [References](#references)
+- [Appendix A: Cost & Performance Analysis](#appendix-a-detailed-cost--performance-analysis)
+- [Appendix B: Southeast Asia Regional Availability](#appendix-b-southeast-asia-regional-availability-analysis)
+
+---
+
 ## TL;DR
 
 GPU scarcity and high costs are forcing enterprise teams to rethink their inference infrastructure. AWS Inferentia2 — a chip built specifically for transformer inference — offers 32 GB of HBM at $1.06/hr (Singapore on-demand), roughly 75% cheaper than the only comparable GPU available in the region (V100). Red Hat and AWS now officially support the Neuron Operator on OpenShift, and vLLM runs natively on Inferentia2 with the same OpenAI-compatible API you'd use on NVIDIA hardware. I deployed and benchmarked a model end-to-end on a ROSA cluster: 338 ms time-to-first-token, 99 tokens/sec steady-state throughput, and sub-1% variance across runs. This article walks through why inference is where the GPU lock-in breaks, how the deployment works, what I measured, and what it costs. Full step-by-step commands are in the [companion guide](vllmoninferentia.md).
