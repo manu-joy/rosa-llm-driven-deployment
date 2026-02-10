@@ -6,7 +6,7 @@
 
 ---
 
-![Manu Joy](https://media.licdn.com/dms/image/v2/D5603AQF7n1SOG_ouMQ/profile-displayphoto-shrink_800_800/profile-displayphoto-shrink_800_800/0/1675959350877?e=1772064000&v=beta&t=svjCSw6uqw4uI0FGb4hUm0PhQpYB5u388UyqJ_7PMK8)
+<img src="https://media.licdn.com/dms/image/v2/D5603AQF7n1SOG_ouMQ/profile-displayphoto-shrink_800_800/profile-displayphoto-shrink_800_800/0/1675959350877?e=1772064000&v=beta&t=svjCSw6uqw4uI0FGb4hUm0PhQpYB5u388UyqJ_7PMK8" alt="Manu Joy" width="200" />
 
 **Author:** Manu Joy  
 **Published:** February 2026  
