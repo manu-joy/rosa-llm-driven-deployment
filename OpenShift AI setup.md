@@ -1,7 +1,9 @@
 # OpenShift AI Setup Agent Instructions
 
+> **Minimum Version Requirement:** This guide requires **Red Hat OpenShift AI v3.2 or above**. All subscription manifests use the `fast` channel with `startingCSV: rhods-operator.3.2.0` to enforce this minimum. The target OpenShift cluster must be running **OpenShift 4.17+** to support RHOAI 3.2+.
+
 ## 🤖 **LLM Role Definition**
-You are an **OpenShift AI Deployment Specialist Agent** with expertise in deploying Red Hat OpenShift AI (RHODS) on ROSA clusters. Your mission is to guide users through a structured, error-free deployment of OpenShift AI with all necessary dependencies and GPU support.
+You are an **OpenShift AI Deployment Specialist Agent** with expertise in deploying Red Hat OpenShift AI (RHODS/RHOAI) on ROSA clusters. Your mission is to guide users through a structured, error-free deployment of **OpenShift AI 3.2+** with all necessary dependencies and accelerator support (GPU, AWS Inferentia2, etc.).
 
 ## 📋 **LLM Workflow for OpenShift AI Deployment (Authoritative Order)**
 
@@ -91,7 +93,7 @@ Based on your inputs, here's the deployment plan:
 **Components**: [list of enabled components]
 
 **Prerequisites Check**:
-- ✅ OpenShift version 4.14+ verified
+- ✅ OpenShift version 4.17+ verified (required for OpenShift AI 3.2+)
 - ✅ Cluster admin access confirmed
 - ✅ Node resources sufficient (16+ vCPU, 64+ GB RAM)
 - ✅ Internet connectivity validated
@@ -181,7 +183,7 @@ Waiting for operator to be ready before proceeding to next step...
 
 | Parameter | Description | Validation Rules | Example |
 |-----------|-------------|------------------|---------|
-| `openshift_version` | OpenShift version | Must be 4.14 or later | `4.19.12` |
+| `openshift_version` | OpenShift version | Must be 4.17 or later (required for RHOAI 3.2+) | `4.19.12` |
 | `worker_nodes` | Number of worker nodes | Minimum 2 nodes | `2` |
 | `node_resources` | CPU/Memory per node | Min 8 vCPU, 32GB RAM | `m5.xlarge` |
 | `storage_class` | Default storage class | Must support dynamic provisioning | `gp3-csi` |
@@ -227,7 +229,7 @@ oc login <api-url> --username=<admin-user> --password=<admin-password>
 
 # Check OpenShift version
 oc version | grep "Server Version"
-# Must be 4.14 or later
+# Must be 4.17 or later (required for OpenShift AI 3.2+)
 
 # Check node resources
 oc get nodes -o wide
@@ -322,7 +324,7 @@ This section provides a comprehensive, phase-by-phase deployment guide for deplo
 
 **Target Architecture:**
 - ROSA HCP cluster with GPU support (g5.2xlarge with NVIDIA A10G GPUs)
-- OpenShift AI 2.22+ with all components
+- OpenShift AI 3.2+ with all components
 - Red Hat Agentic AI demo with GPU-accelerated model serving
 - Model serving with vLLM and GPU acceleration (Granite 3.2-8B & Llama 3.2-3B)
 
@@ -331,7 +333,7 @@ This section provides a comprehensive, phase-by-phase deployment guide for deplo
 **✅ Successfully Tested Configuration:**
 - **Cluster**: ROSA HCP 4.19.12 in us-east-2
 - **Machine Pools**: 2x m5.2xlarge (workers) + 2x g5.2xlarge (GPU workers)
-- **OpenShift AI**: 2.22.1 with full GPU support
+- **OpenShift AI**: 3.2+ with full GPU/accelerator support
 - **Models**: Granite 3.2-8B + Llama 3.2-3B with CUDA acceleration
 - **Status**: 100% functional agentic AI demo
 
@@ -668,12 +670,16 @@ metadata:
   name: rhods-operator
   namespace: openshift-operators
 spec:
-  channel: stable
+  channel: fast
   installPlanApproval: Automatic
   name: rhods-operator
   source: redhat-operators
   sourceNamespace: openshift-marketplace
+  startingCSV: rhods-operator.3.2.0
 EOF
+
+# NOTE: channel "fast" with startingCSV ensures OpenShift AI 3.2+ is installed.
+# The "stable" channel may still resolve to 2.x versions. Use "fast" for 3.2+.
 
 # Wait for OpenShift AI operator to install
 echo "⏳ Waiting for OpenShift AI operator to install..."
@@ -1977,7 +1983,7 @@ gpu-workers:
 
 **OpenShift AI Components:**
 ```yaml
-OpenShift AI Operator: 2.22.1 (Succeeded)
+OpenShift AI Operator: 3.2+ (Succeeded)
 DataScienceCluster: default-dsc (Ready)
 NFD Operator: 4.19.0-202509151411 (Succeeded in openshift-nfd)
 GPU Operator: 25.3.4 (Succeeded in nvidia-gpu-operator)
@@ -2385,7 +2391,11 @@ spec:
   name: rhods-operator
   source: redhat-operators
   sourceNamespace: openshift-marketplace
+  startingCSV: rhods-operator.3.2.0
 EOF
+
+# NOTE: startingCSV ensures minimum version 3.2.0 is installed.
+# Verify with: oc get csv -n redhat-ods-operator | grep rhods
 
 # Wait for OpenShift AI operator to be ready
 oc wait --for=condition=AtLatestKnown subscription/rhods-operator -n redhat-ods-operator --timeout=300s
@@ -3181,7 +3191,7 @@ Llama Stack provides a comprehensive framework for agentic AI operations and adv
 
 ##### **Red Hat's Official Recommendation**
 
-According to [Red Hat OpenShift AI Documentation](https://docs.redhat.com/en/documentation/red_hat_openshift_ai_self-managed/2.22/html/working_with_rag/deploying-a-rag-stack-in-a-data-science-project_rag), Red Hat provides an optimized Llama Stack image specifically designed for OpenShift AI integration.
+According to [Red Hat OpenShift AI Documentation](https://docs.redhat.com/en/documentation/red_hat_openshift_ai_self-managed/2-latest/html/working_with_rag/deploying-a-rag-stack-in-a-data-science-project_rag), Red Hat provides an optimized Llama Stack image specifically designed for OpenShift AI integration.
 
 **🎯 Production Deployment Path:**
 1. **Developer Preview**: `quay.io/opendatahub/llama-stack:odh`
