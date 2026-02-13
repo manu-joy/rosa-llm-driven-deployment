@@ -12,43 +12,16 @@ This guide walks through deploying a HuggingFace-compatible language model on **
 
 ### Architecture Summary
 
-```
-┌──────────────────────────────────────────────────────────────────────┐
-│                        ROSA HCP Cluster                              │
-│                                                                      │
-│  ┌───────────────────────────────────────────────────────────────┐   │
-│  │  Operator Layer (openshift-operators namespace)               │   │
-│  │  ┌─────────────┐  ┌──────────────────┐  ┌─────────────────┐  │   │
-│  │  │     NFD      │  │  KMM (Kernel     │  │  AWS Neuron     │  │   │
-│  │  │  Operator    │  │  Module Mgmt)    │  │  Operator       │  │   │
-│  │  └──────┬───────┘  └────────┬─────────┘  └────────┬────────┘  │   │
-│  │         │                   │                     │           │   │
-│  │         │  NFD Rule         │  Kernel Modules     │ DeviceConfig│  │
-│  │         │  (Neuron PCI      │  (Neuron drivers    │ (Plugin,    │  │
-│  │         │   detection)      │   on node)          │  Scheduler) │  │
-│  │         ▼                   ▼                     ▼           │   │
-│  └───────────────────────────────────────────────────────────────┘   │
-│                              │                                       │
-│                              ▼                                       │
-│  ┌───────────────────────────────────────────────────────────────┐   │
-│  │  Inferentia2 Worker Node (e.g. inf2.xlarge)                   │   │
-│  │  ┌─────────────────────────────────────────────────────────┐  │   │
-│  │  │  Neuron Driver + Device Plugin + Scheduler Extension    │  │   │
-│  │  │  Exposes: aws.amazon.com/neuroncore as K8s resource     │  │   │
-│  │  └─────────────────────────────────────────────────────────┘  │   │
-│  └───────────────────────────────────────────────────────────────┘   │
-│                              │                                       │
-│                              ▼                                       │
-│  ┌───────────────────────────────────────────────────────────────┐   │
-│  │  Application Layer (inference namespace)                      │   │
-│  │  ┌──────────────┐  ┌──────────────┐  ┌────────────────────┐  │   │
-│  │  │ Model PVC    │  │ vLLM Neuron  │  │ Service + Route    │  │   │
-│  │  │ (model files │──│ Deployment   │──│ (OpenAI-compatible │  │   │
-│  │  │  on EBS)     │  │ (container)  │  │  HTTPS endpoint)   │  │   │
-│  │  └──────────────┘  └──────────────┘  └────────────────────┘  │   │
-│  └───────────────────────────────────────────────────────────────┘   │
-└──────────────────────────────────────────────────────────────────────┘
-```
+![vLLM on Inferentia2 — Deployment Architecture](images/vllm-inferentia-architecture.svg)
+
+The architecture is organized into four layers within an **AWS Cloud** boundary. The **ROSA HCP Cluster** encompasses the top two application/platform layers, while the **AWS Infrastructure** (Inferentia2 hardware and storage) sits outside the cluster boundary:
+
+| Layer (top → bottom) | Boundary | Components | Purpose |
+|----------------------|----------|-----------|---------|
+| **AI Application Layer** | ROSA HCP | Model Storage (PVC on EBS **or** S3 bucket), vLLM Neuron Deployment, Service + Route | Store model weights, run vLLM inference on NeuronCores via the Neuron SDK, and expose an OpenAI-compatible HTTPS endpoint. S3 is recommended for production with KServe; PVC on EBS is best for direct Deployments. |
+| **OpenShift Platform Layer** | ROSA HCP | NFD Operator, KMM Operator, AWS Neuron Operator, DeviceConfig CR, OpenShift AI HardwareProfile | Detect Inferentia2 hardware, install Neuron kernel drivers, deploy the device plugin and scheduler, and optionally register the accelerator in the OpenShift AI dashboard. |
+| **Inferentia2 Worker Node** | AWS Infra | Neuron Driver, Device Plugin, Scheduler, Monitor, NeuronCore-v2 hardware | Expose NeuronCores as schedulable Kubernetes resources (`aws.amazon.com/neuroncore`), handle topology-aware pod placement, and emit health/telemetry metrics. |
+| **AWS Storage Services** | AWS Infra | Amazon S3 (model bucket), Amazon EBS (PersistentVolume) | Provide persistent model storage. S3 supports KServe `storageUri`, versioning, and pre-compiled NEFF cache. EBS provides writable ReadWriteOnce PVCs for direct Deployments. |
 
 ### Component Roles
 
@@ -60,6 +33,7 @@ This guide walks through deploying a HuggingFace-compatible language model on **
 | **DeviceConfig CR** | The single custom resource that tells the Neuron Operator which images to use for drivers, device plugin, scheduler, and monitoring. Applied to nodes matching the NFD label. |
 | **Neuron Device Plugin** | Exposes `aws.amazon.com/neuron` (chips) and `aws.amazon.com/neuroncore` (cores) as schedulable Kubernetes resources. |
 | **Neuron Scheduler** | Custom scheduler extension that understands NeuronCore topology for optimal pod placement. |
+| **Neuron Monitor** | Collects health metrics and telemetry from Neuron devices and exports them to Prometheus for observability. |
 | **vLLM with Neuron Plugin** | vLLM V1 with the `vllm-neuron` plugin. Runs inference on NeuronCores via the Neuron SDK. Serves an OpenAI-compatible API. |
 | **HardwareProfile (OpenShift AI)** | Registers the Inferentia2 accelerator in the OpenShift AI dashboard, enabling it for workbenches and model serving. |
 
@@ -83,7 +57,7 @@ The components have strict dependency ordering:
 - **Neuron Compilation**: The first startup of vLLM on Neuron compiles the model ahead-of-time for the specific NeuronCore configuration. This takes **15–45+ minutes** depending on model size. Subsequent restarts use cached artifacts.
 - **No `--device=neuron` flag**: vLLM 0.13.0+ with the Neuron plugin auto-detects Neuron hardware. Do not pass `--device=neuron` — it will cause an unrecognized argument error.
 - **`--block-size=8` is required**: vLLM on Neuron requires an explicit block size when prefix caching is enabled.
-- **Direct Deployment, not KServe InferenceService**: KServe mounts PVCs as read-only, but the Neuron compiler needs to write compiled artifacts to disk. Use a standard OpenShift `Deployment` for full volume control.
+- **Model Storage Options**: For direct Deployments, use a **PVC on EBS** (ReadWriteOnce) so the Neuron compiler can write cached artifacts in-place. For **KServe**, use an **S3 bucket** with `storageUri` — KServe downloads model files to a writable `emptyDir`, and setting `NEURON_COMPILE_CACHE_URL` to a separate `emptyDir` keeps the Neuron cache writable. See Section 3 for detailed KServe approaches.
 - **Security Capabilities**: The Neuron runtime requires `IPC_LOCK` and `SYS_ADMIN` Linux capabilities. These must be granted in the container's `securityContext`.
 - **Container Image**: Use the AWS Neuron Deep Learning Container (DLC) from `public.ecr.aws/neuron/pytorch-inference-vllm-neuronx`. The image is large (~15–20 GB); first pull takes time.
 
@@ -689,6 +663,691 @@ Model Storage (Steps 6-7: PVC + download job)
 | `huggingface-cli: command not found` in download job | CLI not on PATH in minimal Python image | Use `python -m huggingface_hub.commands.hf_cli` instead |
 | Pod stuck in Pending with `neuroncore` resource error | Neuron device plugin not running or DeviceConfig not applied | Verify DeviceConfig exists and device-plugin pod is running |
 | First startup takes 30+ minutes | Normal — Neuron ahead-of-time compilation | Wait for compilation to finish; check logs for progress |
+
+## Section 3: Serving Models with KServe on Inferentia2
+
+### Background: Why Step 9 Uses a Direct Deployment
+
+In Section 2 (Step 9), we deployed vLLM using a standard OpenShift `Deployment` instead of a KServe `InferenceService`. The reason: KServe mounts model PVCs (via `storageUri: pvc://`) as **read-only**, but the Neuron compiler needs to **write** compiled NEFF (Neuron Executable File Format) artifacts during the first startup. The container crashed with `Read-only file system` errors.
+
+However, this limitation can be worked around. The Neuron compiler doesn't need to write to the model directory specifically — it writes to whatever path is set in `NEURON_COMPILE_CACHE_URL`. As long as that path points to a writable volume, the model files themselves can be read-only.
+
+This section describes three approaches for serving models via KServe on Inferentia2 nodes.
+
+---
+
+### Why Neuron Compilation Happens (and What It Produces)
+
+Before diving into the approaches, it helps to understand why compilation is required. Unlike GPUs, where PyTorch operations map to pre-compiled CUDA kernels at runtime, Inferentia2's NeuronCores execute only pre-compiled binary programs. When vLLM starts on Neuron for the first time:
+
+1. **Model Loading** — vLLM loads the PyTorch model weights and architecture from disk
+2. **Graph Tracing / HLO Generation** — The Neuron SDK traces the computational graph and produces HLO (High-Level Operations) intermediate representations, specific to your configuration (tensor-parallel size, max sequence length, block size, batch size, data type)
+3. **Neuron Compiler (`neuron_cc`)** — Each HLO module is compiled into a NEFF binary: operations are fused, mapped to NeuronCore engines (Tensor/Vector/Scalar), memory layout is planned for HBM, and an execution schedule is generated
+4. **Tensor Parallel Distribution** — For multi-core configurations, weight matrices are sharded across NeuronCores with collective communication operations baked into the NEFF
+5. **NEFF Caching** — Compiled artifacts are written to `NEURON_COMPILE_CACHE_URL`. On subsequent restarts with the same configuration, cached NEFFs are loaded directly (startup drops from 15–45 min to a few minutes)
+6. **Runtime Initialization** — NEFFs are loaded onto NeuronCores, KV-cache is allocated in HBM, and the API server starts
+
+Recompilation is required whenever you change the model, `--tensor-parallel-size`, `--max-model-len`, `--max-num-seqs`, `--block-size`, or upgrade the Neuron SDK version. Same model + same config = cache hit, no recompilation.
+
+---
+
+### Approach A: S3 Model Storage + KServe (Recommended)
+
+**Status:** Untested — to be validated on the cluster.
+
+This is the cleanest and most cloud-native approach. When KServe uses `storageUri: s3://...`, the storage initializer (init container) downloads the model from S3 into a **shared emptyDir volume** — which is inherently **writable**. The read-only PVC problem doesn't exist.
+
+#### Why This Approach Works
+
+- S3 is the natural model registry on AWS — versioned, durable, cheap
+- KServe handles S3 download natively (supports IAM roles via IRSA)
+- The downloaded model lands in a writable emptyDir, so Neuron can compile freely
+- A separate emptyDir handles the compilation cache via `NEURON_COMPILE_CACHE_URL`
+- You get all KServe benefits: canary rollouts, autoscaling, traffic splitting, model versioning
+
+#### Step A1: Upload Model to S3
+
+Upload the model files from HuggingFace (or from your existing PVC) to an S3 bucket:
+
+```bash
+# Option 1: Download locally and upload
+pip install huggingface_hub
+python -m huggingface_hub.commands.hf_cli download \
+  TinyLlama/TinyLlama-1.1B-Chat-v1.0 \
+  --local-dir /tmp/tinyllama-1.1b-chat
+
+aws s3 sync /tmp/tinyllama-1.1b-chat s3://<BUCKET_NAME>/models/tinyllama-1.1b-chat/
+
+# Option 2: Copy from existing PVC (run as a Job on the cluster)
+# See Step 7 pattern but replace the download command with:
+# aws s3 sync /models/<MODEL_DIR> s3://<BUCKET_NAME>/models/<MODEL_DIR>/
+```
+
+#### Step A2: Configure S3 Access for KServe
+
+KServe needs AWS credentials to pull from S3. The recommended approach on ROSA is IRSA (IAM Roles for Service Accounts):
+
+```bash
+# Create a ServiceAccount with S3 read access annotation
+cat <<EOF | oc apply -f -
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: kserve-neuron-sa
+  namespace: <NAMESPACE>
+  annotations:
+    eks.amazonaws.com/role-arn: arn:aws:iam::<ACCOUNT_ID>:role/<S3_READ_ROLE>
+EOF
+```
+
+Alternatively, create a Secret with AWS credentials (simpler for testing):
+
+```bash
+cat <<EOF | oc apply -f -
+apiVersion: v1
+kind: Secret
+metadata:
+  name: s3-credentials
+  namespace: <NAMESPACE>
+  annotations:
+    serving.kserve.io/s3-endpoint: s3.amazonaws.com
+    serving.kserve.io/s3-region: <AWS_REGION>
+    serving.kserve.io/s3-usehttps: "1"
+type: Opaque
+stringData:
+  AWS_ACCESS_KEY_ID: "<ACCESS_KEY>"
+  AWS_SECRET_ACCESS_KEY: "<SECRET_KEY>"
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: kserve-neuron-sa
+  namespace: <NAMESPACE>
+secrets:
+  - name: s3-credentials
+EOF
+```
+
+#### Step A3: Create the ServingRuntime for vLLM-Neuron
+
+```bash
+cat <<'EOF' | oc apply -f -
+apiVersion: serving.kserve.io/v1alpha1
+kind: ServingRuntime
+metadata:
+  name: vllm-neuron-runtime
+  namespace: <NAMESPACE>
+spec:
+  supportedModelFormats:
+    - name: pytorch
+      version: "1"
+      autoSelect: true
+  multiModel: false
+  containers:
+    - name: kserve-container
+      image: public.ecr.aws/neuron/pytorch-inference-vllm-neuronx:0.13.0-neuronx-py312-sdk2.27.1-ubuntu24.04
+      command:
+        - python
+        - -m
+        - vllm.entrypoints.openai.api_server
+      args:
+        - --port=8080
+        - --model=/mnt/models
+        - --served-model-name=<MODEL_NAME>
+        - --tensor-parallel-size=<TP_SIZE>
+        - --max-model-len=<MAX_MODEL_LEN>
+        - --max-num-seqs=4
+        - --block-size=8
+      env:
+        - name: HF_HOME
+          value: /tmp/hf_home
+        - name: NEURON_COMPILE_CACHE_URL
+          value: /tmp/neuron_cache
+        - name: FI_EFA_USE_DEVICE_RDMA
+          value: "1"
+        - name: FI_PROVIDER
+          value: "efa"
+        - name: NEURON_RT_VISIBLE_CORES
+          value: "0-1"
+      ports:
+        - containerPort: 8080
+          protocol: TCP
+      resources:
+        requests:
+          cpu: "2"
+          memory: 8Gi
+          aws.amazon.com/neuroncore: "2"
+        limits:
+          cpu: "4"
+          memory: 14Gi
+          aws.amazon.com/neuroncore: "2"
+      securityContext:
+        capabilities:
+          add:
+            - IPC_LOCK
+            - SYS_ADMIN
+      volumeMounts:
+        - name: neuron-cache
+          mountPath: /tmp/neuron_cache
+        - name: hf-cache
+          mountPath: /tmp/hf_home
+  volumes:
+    - name: neuron-cache
+      emptyDir:
+        sizeLimit: 10Gi
+    - name: hf-cache
+      emptyDir:
+        sizeLimit: 1Gi
+EOF
+```
+
+#### Step A4: Create the InferenceService
+
+```bash
+cat <<EOF | oc apply -f -
+apiVersion: serving.kserve.io/v1beta1
+kind: InferenceService
+metadata:
+  name: <MODEL_NAME>-neuron
+  namespace: <NAMESPACE>
+  annotations:
+    serving.kserve.io/deploymentMode: RawDeployment
+spec:
+  predictor:
+    serviceAccountName: kserve-neuron-sa
+    model:
+      modelFormat:
+        name: pytorch
+      runtime: vllm-neuron-runtime
+      storageUri: s3://<BUCKET_NAME>/models/<MODEL_DIR>
+    nodeSelector:
+      node.kubernetes.io/instance-type: <INSTANCE_TYPE>
+EOF
+```
+
+#### Step A5: Verify
+
+```bash
+# Check InferenceService status
+oc get inferenceservice <MODEL_NAME>-neuron -n <NAMESPACE>
+
+# Monitor startup (including Neuron compilation)
+oc logs -f -l serving.kserve.io/inferenceservice=<MODEL_NAME>-neuron -n <NAMESPACE>
+
+# Test once ready
+ISVC_URL=$(oc get inferenceservice <MODEL_NAME>-neuron -n <NAMESPACE> -o jsonpath='{.status.url}')
+curl -sk $ISVC_URL/v1/models | python3 -m json.tool
+```
+
+#### Trade-offs
+
+| Aspect | Detail |
+|--------|--------|
+| **Model download** | Re-downloaded from S3 on every pod restart. For a 16 GB model, adds 3–5 min to startup. |
+| **Compilation** | Still happens on first deploy with a new model/config. 15–45 min. |
+| **Subsequent restarts** | Model download (3–5 min) + compilation (15–45 min) unless NEFF cache is also in S3 (see Approach B). |
+| **Cost** | S3 storage is cheap (~$0.025/GB/month). Data transfer within same region is free. |
+
+---
+
+### Approach B: Pre-Compilation Pipeline + S3 + KServe (Best for Production)
+
+**Status:** Untested — to be validated on the cluster.
+
+This approach eliminates the 15–45 minute compilation wait by pre-compiling the model and uploading the NEFF cache to S3 alongside the weights. On KServe startup, the storage initializer downloads both model + cache, and Neuron skips compilation entirely.
+
+#### Why This Approach Works
+
+- Compilation is a one-time CI/CD step, not a runtime cost
+- Pod startup is just model download (3–5 min) — no compilation wait
+- Pre-compiled artifacts are versioned in S3 alongside the model
+- Fits naturally into GitOps / pipeline-driven model deployment
+
+#### Step B1: Run the Pre-Compilation Job
+
+This Job starts vLLM on the Inferentia node, waits for compilation to finish, then uploads the NEFF cache to S3:
+
+```bash
+cat <<'EOF' | oc apply -f -
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: neuron-precompile-<MODEL_DIR>
+  namespace: <NAMESPACE>
+spec:
+  template:
+    spec:
+      nodeSelector:
+        node.kubernetes.io/instance-type: <INSTANCE_TYPE>
+      containers:
+      - name: compiler
+        image: public.ecr.aws/neuron/pytorch-inference-vllm-neuronx:0.13.0-neuronx-py312-sdk2.27.1-ubuntu24.04
+        command:
+        - /bin/bash
+        - -c
+        - |
+          set -e
+          echo "=== Starting Neuron pre-compilation ==="
+          
+          # Start vLLM in background to trigger compilation
+          python -m vllm.entrypoints.openai.api_server \
+            --model /mnt/models/<MODEL_DIR> \
+            --served-model-name=<MODEL_NAME> \
+            --tensor-parallel-size=<TP_SIZE> \
+            --max-model-len=<MAX_MODEL_LEN> \
+            --max-num-seqs=4 \
+            --block-size=8 \
+            --port=8080 &
+          VLLM_PID=$!
+          
+          # Wait for compilation to finish (poll health endpoint)
+          echo "Waiting for Neuron compilation to complete..."
+          ATTEMPTS=0
+          MAX_ATTEMPTS=120  # 60 minutes max (30s intervals)
+          until curl -sf http://localhost:8080/health > /dev/null 2>&1; do
+            ATTEMPTS=$((ATTEMPTS + 1))
+            if [ $ATTEMPTS -ge $MAX_ATTEMPTS ]; then
+              echo "ERROR: Compilation timed out after 60 minutes"
+              kill $VLLM_PID 2>/dev/null
+              exit 1
+            fi
+            echo "  Compilation in progress... (attempt $ATTEMPTS/$MAX_ATTEMPTS)"
+            sleep 30
+          done
+          
+          echo "=== Compilation complete. Uploading NEFF cache to S3 ==="
+          
+          # Install AWS CLI and upload
+          pip install -q awscli
+          aws s3 sync /tmp/neuron_cache \
+            s3://<BUCKET_NAME>/models/<MODEL_DIR>-compiled/neuron_cache/ \
+            --region <AWS_REGION>
+          
+          echo "=== NEFF cache uploaded to s3://<BUCKET_NAME>/models/<MODEL_DIR>-compiled/neuron_cache/ ==="
+          
+          # Clean shutdown
+          kill $VLLM_PID 2>/dev/null
+          wait $VLLM_PID 2>/dev/null || true
+          echo "Done."
+        env:
+        - name: HF_HOME
+          value: /tmp/hf_home
+        - name: NEURON_COMPILE_CACHE_URL
+          value: /tmp/neuron_cache
+        - name: FI_EFA_USE_DEVICE_RDMA
+          value: "1"
+        - name: FI_PROVIDER
+          value: "efa"
+        - name: NEURON_RT_VISIBLE_CORES
+          value: "0-1"
+        - name: AWS_ACCESS_KEY_ID
+          value: "<ACCESS_KEY>"
+        - name: AWS_SECRET_ACCESS_KEY
+          value: "<SECRET_KEY>"
+        - name: AWS_DEFAULT_REGION
+          value: "<AWS_REGION>"
+        resources:
+          requests:
+            cpu: "2"
+            memory: 8Gi
+            aws.amazon.com/neuroncore: "2"
+          limits:
+            cpu: "4"
+            memory: 14Gi
+            aws.amazon.com/neuroncore: "2"
+        securityContext:
+          capabilities:
+            add:
+            - IPC_LOCK
+            - SYS_ADMIN
+        volumeMounts:
+        - name: model-storage
+          mountPath: /mnt/models
+        - name: neuron-cache
+          mountPath: /tmp/neuron_cache
+        - name: hf-cache
+          mountPath: /tmp/hf_home
+      volumes:
+      - name: model-storage
+        persistentVolumeClaim:
+          claimName: <PVC_NAME>
+      - name: neuron-cache
+        emptyDir:
+          sizeLimit: 10Gi
+      - name: hf-cache
+        emptyDir:
+          sizeLimit: 1Gi
+      restartPolicy: Never
+  backoffLimit: 1
+EOF
+```
+
+> **Note**: For production, use a Kubernetes Secret or IRSA for AWS credentials instead of inline environment variables.
+
+Monitor the job:
+
+```bash
+oc logs -f job/neuron-precompile-<MODEL_DIR> -n <NAMESPACE>
+```
+
+#### Step B2: Update the ServingRuntime to Load Pre-Compiled Cache
+
+Modify the `ServingRuntime` from Approach A to include an init container that downloads the NEFF cache from S3 before the main container starts:
+
+```bash
+cat <<'EOF' | oc apply -f -
+apiVersion: serving.kserve.io/v1alpha1
+kind: ServingRuntime
+metadata:
+  name: vllm-neuron-precompiled-runtime
+  namespace: <NAMESPACE>
+spec:
+  supportedModelFormats:
+    - name: pytorch
+      version: "1"
+      autoSelect: true
+  multiModel: false
+  containers:
+    - name: kserve-container
+      image: public.ecr.aws/neuron/pytorch-inference-vllm-neuronx:0.13.0-neuronx-py312-sdk2.27.1-ubuntu24.04
+      command:
+        - python
+        - -m
+        - vllm.entrypoints.openai.api_server
+      args:
+        - --port=8080
+        - --model=/mnt/models
+        - --served-model-name=<MODEL_NAME>
+        - --tensor-parallel-size=<TP_SIZE>
+        - --max-model-len=<MAX_MODEL_LEN>
+        - --max-num-seqs=4
+        - --block-size=8
+      env:
+        - name: HF_HOME
+          value: /tmp/hf_home
+        - name: NEURON_COMPILE_CACHE_URL
+          value: /tmp/neuron_cache
+        - name: FI_EFA_USE_DEVICE_RDMA
+          value: "1"
+        - name: FI_PROVIDER
+          value: "efa"
+        - name: NEURON_RT_VISIBLE_CORES
+          value: "0-1"
+      ports:
+        - containerPort: 8080
+          protocol: TCP
+      resources:
+        requests:
+          cpu: "2"
+          memory: 8Gi
+          aws.amazon.com/neuroncore: "2"
+        limits:
+          cpu: "4"
+          memory: 14Gi
+          aws.amazon.com/neuroncore: "2"
+      securityContext:
+        capabilities:
+          add:
+            - IPC_LOCK
+            - SYS_ADMIN
+      volumeMounts:
+        - name: neuron-cache
+          mountPath: /tmp/neuron_cache
+        - name: hf-cache
+          mountPath: /tmp/hf_home
+  volumes:
+    - name: neuron-cache
+      emptyDir:
+        sizeLimit: 10Gi
+    - name: hf-cache
+      emptyDir:
+        sizeLimit: 1Gi
+EOF
+```
+
+> **Open question (to be validated):** KServe's storage initializer downloads the S3 contents to `/mnt/models`. If you structure S3 to include both the model weights and a `neuron_cache/` subdirectory, you may be able to set `NEURON_COMPILE_CACHE_URL=/mnt/models/neuron_cache` and avoid a separate init container entirely — provided the KServe emptyDir is writable (which it should be for S3-sourced models). This needs testing.
+
+#### Step B3: Deploy InferenceService
+
+Same as Approach A (Step A4), just reference the precompiled runtime:
+
+```bash
+cat <<EOF | oc apply -f -
+apiVersion: serving.kserve.io/v1beta1
+kind: InferenceService
+metadata:
+  name: <MODEL_NAME>-neuron
+  namespace: <NAMESPACE>
+  annotations:
+    serving.kserve.io/deploymentMode: RawDeployment
+spec:
+  predictor:
+    serviceAccountName: kserve-neuron-sa
+    model:
+      modelFormat:
+        name: pytorch
+      runtime: vllm-neuron-precompiled-runtime
+      storageUri: s3://<BUCKET_NAME>/models/<MODEL_DIR>
+    nodeSelector:
+      node.kubernetes.io/instance-type: <INSTANCE_TYPE>
+EOF
+```
+
+#### When to Re-Run the Pre-Compilation Job
+
+| Change | Recompile Required? |
+|--------|-------------------|
+| Different model | Yes |
+| Different `--tensor-parallel-size` | Yes |
+| Different `--max-model-len` | Yes |
+| Different `--max-num-seqs` | Yes |
+| Different `--block-size` | Yes |
+| Different Neuron SDK version (container image) | Yes |
+| Same model + same config + same SDK | No — cached NEFFs are reused |
+
+#### Trade-offs
+
+| Aspect | Detail |
+|--------|--------|
+| **Startup time** | Model download only (3–5 min for 16 GB). No compilation wait. |
+| **Operational complexity** | Requires a compilation step in CI/CD pipeline. |
+| **Storage** | NEFF cache adds ~5–15 GB to S3 storage per model configuration. |
+| **Portability** | NEFFs are tied to Neuron SDK version + NeuronCore count + compile-time params. |
+
+---
+
+### Approach C: EFS-Backed ReadWriteMany PVC + KServe
+
+**Status:** Untested — to be validated on the cluster.
+
+Instead of S3, use an Amazon EFS filesystem with a `ReadWriteMany` PVC. The model files are pre-loaded on the PVC and the Neuron compilation cache is directed to a separate writable emptyDir.
+
+#### Why This Approach Works
+
+- EFS supports `ReadWriteMany`, so the PVC can be shared across pods
+- Even if KServe mounts the model PVC as read-only, the compilation cache goes to a separate writable emptyDir via `NEURON_COMPILE_CACHE_URL`
+- No S3 setup needed — model files are on a persistent, always-mounted volume
+- No re-download on pod restart — model is already on the PVC
+
+#### Step C1: Install the EFS CSI Driver
+
+If not already installed on your ROSA cluster:
+
+```bash
+# Check if EFS CSI driver is available
+oc get csidriver efs.csi.aws.com
+
+# If not present, install the AWS EFS CSI Driver Operator from OperatorHub
+cat <<'EOF' | oc apply -f -
+apiVersion: operators.coreos.com/v1alpha1
+kind: Subscription
+metadata:
+  name: aws-efs-csi-driver-operator
+  namespace: openshift-cluster-csi-drivers
+spec:
+  channel: stable
+  name: aws-efs-csi-driver-operator
+  source: redhat-operators
+  sourceNamespace: openshift-marketplace
+  installPlanApproval: Automatic
+EOF
+```
+
+#### Step C2: Create EFS Filesystem and StorageClass
+
+```bash
+# Create an EFS filesystem in your VPC (via AWS CLI)
+EFS_ID=$(aws efs create-file-system \
+  --performance-mode generalPurpose \
+  --throughput-mode bursting \
+  --tags Key=Name,Value=rosa-model-storage \
+  --region <AWS_REGION> \
+  --query 'FileSystemId' --output text)
+
+echo "EFS ID: $EFS_ID"
+
+# Create mount targets in each subnet used by your cluster
+aws efs create-mount-target \
+  --file-system-id $EFS_ID \
+  --subnet-id <SUBNET_ID> \
+  --security-groups <SECURITY_GROUP_ID> \
+  --region <AWS_REGION>
+
+# Create the StorageClass
+cat <<EOF | oc apply -f -
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: efs-sc
+provisioner: efs.csi.aws.com
+parameters:
+  provisioningMode: efs-ap
+  fileSystemId: $EFS_ID
+  directoryPerms: "700"
+EOF
+```
+
+#### Step C3: Create the EFS PVC and Download Model
+
+```bash
+cat <<EOF | oc apply -f -
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: efs-model-storage
+  namespace: <NAMESPACE>
+spec:
+  accessModes:
+    - ReadWriteMany
+  storageClassName: efs-sc
+  resources:
+    requests:
+      storage: 50Gi
+EOF
+```
+
+Download the model onto the EFS PVC using the same Job pattern from Step 7, but targeting the EFS PVC:
+
+```bash
+cat <<EOF | oc apply -f -
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: download-model-efs
+  namespace: <NAMESPACE>
+spec:
+  template:
+    spec:
+      nodeSelector:
+        node.kubernetes.io/instance-type: <INSTANCE_TYPE>
+      containers:
+      - name: downloader
+        image: python:3.11-slim
+        command:
+        - /bin/bash
+        - -c
+        - |
+          pip install huggingface_hub
+          python -m huggingface_hub.commands.hf_cli download \
+            <MODEL_REPO> \
+            --local-dir /models/<MODEL_DIR>
+        volumeMounts:
+        - name: model-storage
+          mountPath: /models
+      volumes:
+      - name: model-storage
+        persistentVolumeClaim:
+          claimName: efs-model-storage
+      restartPolicy: Never
+  backoffLimit: 2
+EOF
+```
+
+#### Step C4: Deploy with KServe
+
+Use the same `ServingRuntime` from Approach A, then create the `InferenceService` pointing to the EFS PVC:
+
+```bash
+cat <<EOF | oc apply -f -
+apiVersion: serving.kserve.io/v1beta1
+kind: InferenceService
+metadata:
+  name: <MODEL_NAME>-neuron
+  namespace: <NAMESPACE>
+  annotations:
+    serving.kserve.io/deploymentMode: RawDeployment
+spec:
+  predictor:
+    model:
+      modelFormat:
+        name: pytorch
+      runtime: vllm-neuron-runtime
+      storageUri: pvc://efs-model-storage/<MODEL_DIR>
+    nodeSelector:
+      node.kubernetes.io/instance-type: <INSTANCE_TYPE>
+EOF
+```
+
+> **Key assumption (to be validated):** This approach relies on the Neuron SDK writing compilation artifacts **only** to `NEURON_COMPILE_CACHE_URL` (the writable emptyDir) and **not** to the model directory. If the SDK or vLLM writes additional files to the model path, the read-only PVC mount will still fail. This must be tested.
+
+#### Trade-offs
+
+| Aspect | Detail |
+|--------|--------|
+| **Startup time** | No model download (already on PVC). Compilation on first deploy (15–45 min). |
+| **I/O performance** | EFS latency (~2–5 ms per op) is higher than EBS. May slow model loading. |
+| **Cost** | EFS is ~$0.30/GB/month vs EBS at ~$0.08/GB/month. Marginal for model-sized data. |
+| **Multi-pod** | ReadWriteMany allows multiple pods to mount the same model PVC simultaneously. |
+
+---
+
+### Comparison: Which KServe Approach to Choose
+
+| Criteria | Approach A (S3) | Approach B (Pre-Compile + S3) | Approach C (EFS PVC) |
+|----------|----------------|-------------------------------|---------------------|
+| **Startup time** | Download + compile (20–50 min) | Download only (3–5 min) | Compile only (15–45 min) |
+| **Operational complexity** | Low | Medium (CI/CD step) | Medium (EFS setup) |
+| **Model versioning** | S3 versioning | S3 versioning | Manual PVC management |
+| **Cost** | S3 ($0.025/GB/mo) | S3 ($0.025/GB/mo) | EFS ($0.30/GB/mo) |
+| **Re-download on restart** | Yes | Yes | No |
+| **Re-compile on restart** | Yes (no cache) | No (cache in S3) | Yes (emptyDir lost) |
+| **Best for** | Getting started | Production at scale | Teams already using EFS |
+
+**Recommendation:** Start with **Approach A** (S3 + KServe) for initial validation. Graduate to **Approach B** (pre-compilation pipeline) when you need fast, predictable startup times in production. Use **Approach C** (EFS) only if you have an existing EFS-based workflow or need multi-pod concurrent access to the same model files.
+
+---
+
+### Open Questions (To Be Validated)
+
+These items need practical testing on the cluster:
+
+1. **KServe emptyDir writability**: Confirm that when using `storageUri: s3://...`, the shared volume at `/mnt/models` is writable by the serving container (not just the init container).
+2. **Neuron write isolation**: Verify that setting `NEURON_COMPILE_CACHE_URL` to a separate path prevents ALL writes to the model directory. If vLLM or the Neuron SDK writes additional files (tokenizer cache, config files) to the model path, read-only PVC mounts will still fail.
+3. **NEFF cache in S3 bundle**: Test whether placing pre-compiled NEFF artifacts inside the S3 model directory (e.g., `s3://bucket/model/neuron_cache/`) and pointing `NEURON_COMPILE_CACHE_URL=/mnt/models/neuron_cache` allows Neuron to skip compilation entirely.
+4. **KServe annotations**: Validate whether `serving.kserve.io/deploymentMode: RawDeployment` is required for Inferentia2 workloads, or if the Serverless (Knative) mode also works with NeuronCore resource requests.
+5. **Security context propagation**: Confirm that `IPC_LOCK` and `SYS_ADMIN` capabilities set in the `ServingRuntime` are propagated correctly to the running pod by KServe.
+
+---
 
 ## Appendix C: Useful Commands
 
