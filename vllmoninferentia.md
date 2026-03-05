@@ -1376,7 +1376,87 @@ curl -sk https://<ROUTE>/v1/completions \
   -d '{"model": "<MODEL_NAME>", "prompt": "Hello", "max_tokens": 50}'
 ```
 
-## Appendix D: References
+## Appendix D: Lessons Learned — KServe, vLLM, and Model Compatibility on Inferentia2
+
+This section documents issues encountered during hands-on testing of LLM deployment on AWS Inferentia2 (`inf2.xlarge`, 2 NeuronCores, 32 GB HBM) with ROSA HCP, OpenShift AI 2.25, and the Neuron SDK 2.27.
+
+### 1. FP8 Quantized Models Produce Garbage Output on Neuron
+
+**Model tested:** `RedHatAI/Llama-3.2-3B-Instruct-FP8-dynamic` (compressed-tensors FP8 quantization)
+
+The Neuron compiler accepted the model, HLO generation succeeded, NEFF compilation passed, and the vLLM health endpoint returned `200 OK`. However, **all inference responses were nonsensical garbage text**. The root cause: Neuron's internal dequantization does not correctly handle the `compressed-tensors` FP8 scheme. Weights are silently corrupted during the FP8-to-BF16 cast on the NeuronCores.
+
+**Takeaway:** Only deploy models in **BF16** (native Neuron precision) or **FP32** (auto-downcast to BF16). Avoid FP8, GPTQ, AWQ, and other quantized formats unless explicitly validated on Neuron hardware.
+
+### 2. KServe InferenceService Crashes Hide Root Cause Errors
+
+When deploying via KServe (`serving.kserve.io/deploymentMode: RawDeployment`), the vLLM container repeatedly crashed with:
+
+```
+RuntimeError: Engine core initialization failed. See root cause above. Failed core proc(s): {}
+```
+
+The `Failed core proc(s): {}` message is empty because vLLM v1's multiprocess architecture spawns the EngineCore as a subprocess, and when that subprocess OOM-kills or crashes, its stderr output is lost before KServe's log collector captures it. The KServe pod enters `CrashLoopBackOff` with no actionable error.
+
+**Workaround:** For debugging, skip KServe and deploy vLLM directly as a Kubernetes `Deployment` with a `Service` and `Route`. This preserves full stdout/stderr interleaving and lets you add `2>&1` redirection, `VLLM_LOGGING_LEVEL=DEBUG`, or run Python scripts directly via `oc exec`.
+
+### 3. Neuron Compilation OOM on inf2.xlarge for 7B+ Models
+
+The `inf2.xlarge` instance has only 4 vCPU and ~14.5 GiB allocatable CPU RAM. During Neuron compilation (not inference), the compiler needs to hold the model weights in CPU memory while generating and optimizing HLO graphs.
+
+- **Qwen 2.5 7B (14 GB BF16):** Compilation OOM-killed the node. The kubelet stopped responding, all conditions went `Unknown`, and the EC2 instance was terminated by the machine pool's autorepair. Even with `max-model-len=512` and `max-num-seqs=1`, compilation consumed all CPU RAM.
+- **Qwen3 4B (8 GB BF16):** Compiled successfully with `max-model-len=512`, `max-num-seqs=1`, 12 GiB memory limit. Node stayed healthy (`MemoryPressure=False`).
+- **Llama 3.2 3B FP8 (6 GB):** Compiled successfully with `max-model-len=2048`, `max-num-seqs=4`.
+
+**Rule of thumb:** On `inf2.xlarge`, models up to ~8 GB in BF16 can compile. For larger models, use `inf2.8xlarge` (32 vCPU, 128 GiB RAM) or pre-compile on a larger instance.
+
+### 4. NEFF Cache Is Specific to Exact vLLM Parameters
+
+The Neuron NEFF (Neuron Executable File Format) cache key includes `tensor-parallel-size`, `max-model-len`, `max-num-seqs`, `block-size`, and the model architecture hash. Changing any of these parameters invalidates the cache and triggers a full recompilation (10-20+ minutes).
+
+**Best practice:** Fix your vLLM parameters early and pre-compile once. Store the NEFF cache on a PVC (for fast reuse on pod restart) and also push it to S3 (for disaster recovery / new node provisioning). Point `NEURON_COMPILE_CACHE_URL` to the PVC mount path.
+
+### 5. PVC-Based Model Storage Is Faster Than S3 for Serving
+
+KServe's storage initializer downloads the full model from S3 to a local `emptyDir` on every pod startup. For an 8 GB model, this adds ~60-90 seconds even on fast AWS-internal networking. Using a PVC (EBS gp3-csi) eliminates this download — the model is already on the attached volume and vLLM reads it directly.
+
+**Recommended architecture for production:**
+- **Model weights:** PVC (EBS gp3-csi, ReadWriteOnce) + S3 backup
+- **NEFF cache:** PVC (EBS gp3-csi, ReadWriteOnce) + S3 backup
+- **Deployment:** Plain Kubernetes `Deployment` with `Service` + `Route` (or KServe once debugging is complete)
+
+### 6. Direct vLLM Deployment Is More Reliable Than KServe for Inferentia2
+
+During testing, KServe's RawDeployment mode introduced several complications:
+- The storage initializer added latency and complexity
+- Probe configuration was difficult to tune (Neuron compilation can take 10-20 minutes before the first health check passes)
+- Error messages from the EngineCore subprocess were swallowed
+- Resource limit propagation between InferenceService and ServingRuntime was non-obvious
+
+A plain Kubernetes `Deployment` + `Service` + `Route` provided:
+- Direct control over volume mounts (PVC for model, PVC for NEFF cache)
+- Full log visibility
+- Simple startup/liveness/readiness probes with generous `initialDelaySeconds` and `failureThreshold`
+- Easier debugging via `oc exec` and `oc logs`
+
+KServe remains valuable for multi-model serving, canary rollouts, and autoscaling at scale. But for initial Inferentia2 bring-up and single-model deployments, the plain Deployment approach is recommended.
+
+### 7. Successfully Tested Configuration
+
+| Component | Value |
+|-----------|-------|
+| **Model** | Qwen/Qwen3-4B (BF16, 8 GB) |
+| **Instance** | inf2.xlarge (2 NeuronCores, 32 GB HBM, 4 vCPU, 16 GB RAM) |
+| **Container** | `public.ecr.aws/neuron/pytorch-inference-vllm-neuronx:0.13.0-neuronx-py312-sdk2.27.1-ubuntu24.04` |
+| **vLLM flags** | `--tensor-parallel-size=2 --max-model-len=512 --max-num-seqs=1 --block-size=8` |
+| **Compilation time** | ~10 minutes (first startup) |
+| **Startup with NEFF cache** | ~2-3 minutes |
+| **Inference latency** | ~2 seconds for 30 tokens |
+| **Storage** | Model on PVC (EBS gp3), NEFF cache on PVC (EBS gp3), both backed up to S3 |
+
+---
+
+## Appendix E: References
 
 - [Run cost-effective AI workloads on OpenShift with AWS Neuron Operator](https://developers.redhat.com/articles/2025/12/02/cost-effective-ai-workloads-openshift-aws-neuron-operator)
 - [AWS Neuron Documentation](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/)
