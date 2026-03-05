@@ -747,6 +747,52 @@ I'd recommend contacting your AWS account team for the most current regional ava
 
 ---
 
+---
+
+## Things To Do: Model Compatibility Testing for Inferentia2
+
+This section tracks outstanding research and testing needed to compile a definitive list of models suitable for AWS Inferentia2 deployment.
+
+### Why BF16 Is Required
+
+AWS Inferentia2 NeuronCores natively operate in **BF16 (Brain Float 16)** precision. During model loading, the Neuron runtime loads weights directly into the chip's 32 GB HBM in BF16 format. Models distributed in BF16 work without any conversion overhead. Models in FP32 are automatically downcast to BF16 by the Neuron compiler, which works but wastes download bandwidth and increases load time.
+
+**FP8 and other quantized formats are problematic.** During testing, we deployed `RedHatAI/Llama-3.2-3B-Instruct-FP8-dynamic` (using the `compressed-tensors` quantization scheme) on an `inf2.xlarge` node. The Neuron compiler appeared to compile and load the model successfully, and the vLLM health endpoint returned healthy. However, inference output was **garbage text** — the Neuron runtime's internal FP8-to-BF16 dequantization did not correctly handle the `compressed-tensors` format, producing corrupted weights at the hardware level. This is a silent failure: no error is raised, but every response is nonsensical.
+
+**Key takeaway:** Only deploy models in **BF16** (preferred) or **FP32** (auto-downcast) on Inferentia2. Avoid FP8, GPTQ, AWQ, and other quantized formats unless explicitly validated on Neuron.
+
+### Research Items
+
+- [ ] **Compile a validated model list for Inferentia2** — Test and document which HuggingFace models (by name and revision) produce correct inference output on `inf2.xlarge` (2 NeuronCores, 32 GB HBM) and `inf2.8xlarge` (4 NeuronCores, 64 GB HBM). Include model size, format, and any required vLLM flags.
+
+- [ ] **Test BF16 native models across architectures** — Validate models from each Neuron-supported architecture (Llama, Qwen2.5, Qwen3, Mixtral, DBRX) in their native BF16 checkpoints. Record compilation time, peak CPU memory during compilation, and inference quality.
+
+- [ ] **Test FP16 models** — Determine whether FP16 (IEEE half-precision) models work correctly on Neuron or if they require explicit conversion to BF16 before deployment. Document any precision loss or behavioural differences vs. BF16.
+
+- [ ] **Investigate INT8 quantization on Neuron** — AWS Neuron SDK 2.27+ documents INT8 support via NxD Inference. Test whether INT8-quantized models (e.g., via `optimum-neuron` or GPTQ-INT8) produce correct output and what performance/quality trade-off exists.
+
+- [ ] **Document the Neuron compilation memory budget** — Profile CPU RAM usage during Neuron compilation for models at different sizes (1B, 3B, 4B, 7B, 12B) on `inf2.xlarge` (14.5 GiB allocatable). Determine the maximum model size that can be compiled on each instance type without OOM-killing the node.
+
+- [ ] **Test pre-compilation vs. on-the-fly compilation** — Compare startup time, reliability, and NEFF cache sizes for pre-compiled models (stored in S3) vs. letting vLLM compile at first startup. Document the recommended approach for production deployments.
+
+- [ ] **Validate Neuron SDK version compatibility** — Test models across Neuron SDK 2.25, 2.26, and 2.27 to identify any regressions or new model support. Document which SDK version is recommended for each model family.
+
+- [ ] **Evaluate `tensor-parallel-size` options** — For models that exceed single NeuronCore capacity, test TP=2 on `inf2.xlarge` and TP=4/8/12 on larger `inf2` instances. Document the minimum TP degree needed per model size.
+
+### Supported Model Formats Summary (To Be Validated)
+
+| Format | Status on Inferentia2 | Notes |
+|--------|----------------------|-------|
+| **BF16** (safetensors) | Recommended | Native Neuron precision, zero conversion overhead |
+| **FP32** (safetensors) | Works | Auto-downcast to BF16 by Neuron compiler; larger download |
+| **FP16** (safetensors) | To be tested | May work via auto-cast; needs validation |
+| **FP8** (compressed-tensors) | Broken | Silent failure — produces garbage output |
+| **GPTQ** (INT4/INT8) | To be tested | Not natively supported; may work via Neuron INT8 path |
+| **AWQ** (INT4) | To be tested | Unlikely to work natively; needs investigation |
+| **GGUF** | Not supported | CPU-only format; not applicable to Neuron |
+
+---
+
 If you're exploring Inferentia2 for your own workloads, I'd love to hear how it goes. Reach out on [LinkedIn](https://www.linkedin.com/in/manujoy/) or connect with the Red Hat and AWS teams directly:
 
 [Red Hat AI Solutions](https://www.redhat.com/en/solutions/ai) · [AWS Machine Learning](https://aws.amazon.com/machine-learning/) · [Deployment Guide](vllmoninferentia.md)
