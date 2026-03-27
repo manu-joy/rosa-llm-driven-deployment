@@ -54,12 +54,27 @@ The components have strict dependency ordering:
 
 ### Key Technical Notes
 
-- **Neuron Compilation**: The first startup of vLLM on Neuron compiles the model ahead-of-time for the specific NeuronCore configuration. This takes **15–45+ minutes** depending on model size. Subsequent restarts use cached artifacts.
+- **Neuron Compilation**: The first startup of vLLM on Neuron compiles the model ahead-of-time for the specific NeuronCore configuration. This takes **15–45+ minutes** for dense models and **30–60+ minutes** for MoE models. Subsequent restarts use cached artifacts.
 - **No `--device=neuron` flag**: vLLM 0.13.0+ with the Neuron plugin auto-detects Neuron hardware. Do not pass `--device=neuron` — it will cause an unrecognized argument error.
-- **`--block-size=8` is required**: vLLM on Neuron requires an explicit block size when prefix caching is enabled.
+- **`--block-size`**: vLLM on Neuron requires an explicit block size. Use `--block-size=8` for dense models (when prefix caching is enabled) or `--block-size=32` for MoE models.
 - **Model Storage Options**: For direct Deployments, use a **PVC on EBS** (ReadWriteOnce) so the Neuron compiler can write cached artifacts in-place. For **KServe**, use an **S3 bucket** with `storageUri` — KServe downloads model files to a writable `emptyDir`, and setting `NEURON_COMPILE_CACHE_URL` to a separate `emptyDir` keeps the Neuron cache writable. See Section 3 for detailed KServe approaches.
 - **Security Capabilities**: The Neuron runtime requires `IPC_LOCK` and `SYS_ADMIN` Linux capabilities. These must be granted in the container's `securityContext`.
-- **Container Image**: Use the AWS Neuron Deep Learning Container (DLC) from `public.ecr.aws/neuron/pytorch-inference-vllm-neuronx`. The image is large (~15–20 GB); first pull takes time.
+- **Container Image**: Use the AWS Neuron Deep Learning Container (DLC) from `public.ecr.aws/neuron/pytorch-inference-vllm-neuronx`. The image is large (~15–20 GB); first pull takes time. Use SDK 2.28.0+ for MoE model support.
+
+### MoE (Mixture-of-Experts) Model Notes
+
+Deploying MoE models (e.g., Qwen3-Coder-30B-A3B, Qwen3-235B-A22B) on Inferentia2 requires additional configuration beyond dense model deployments:
+
+- **`VLLM_NEURON_FRAMEWORK=neuronx-distributed-inference`**: This environment variable is **mandatory** for MoE models. It tells vLLM to use the NxD Inference library which supports expert parallelism.
+- **`--additional-config`**: MoE models require Neuron override configuration passed via the `--additional-config` flag. This includes `tp_degree`, `moe_tp_degree`, `moe_ep_degree`, bucketing, and kernel optimization flags. See Step 9 for the full configuration.
+- **Batch size >= 16**: Qwen3 MoE has a documented hard requirement of `batch_size >= 16` in the Neuron config. Set `--max-num-seqs=16` accordingly.
+- **Chunked prefill is NOT supported**: Always pass `--no-enable-chunked-prefill` on Neuron.
+- **Prefix caching**: Disable with `--no-enable-prefix-caching` for MoE models.
+- **`--num-gpu-blocks-override`**: Required to avoid scheduler mismatch when chunked prefill and prefix caching are both disabled. Set to match `--max-num-seqs`.
+- **Expert parallelism**: The constraint `moe_tp_degree × moe_ep_degree = tp_degree` must hold. For `inf2.24xlarge` (12 NeuronCores), use `tp_degree=12, moe_tp_degree=1, moe_ep_degree=12`. For `inf2.48xlarge` (24 NeuronCores), use `tp_degree=24, moe_tp_degree=2, moe_ep_degree=12`.
+- **Memory**: All expert weights must reside in HBM even though only a subset are active per token. A 30B-parameter MoE model requires ~61 GB in BF16 — `inf2.24xlarge` (192 GB HBM) is the minimum viable instance.
+- **Neuron scheduler**: Use `schedulerName: neuron-scheduler` in the pod spec for topology-aware placement across NeuronCores.
+- **Shared memory**: Mount `/dev/shm` as an emptyDir with `medium: Memory` for inter-process communication during MoE inference.
 
 ### Inferentia2 Instance Types
 
@@ -99,8 +114,10 @@ Replace these placeholders with your actual values:
 | `<MODEL_REPO>` | HuggingFace model repository | `TinyLlama/TinyLlama-1.1B-Chat-v1.0` |
 | `<MODEL_DIR>` | Directory name for model on PVC | `tinyllama-1.1b-chat` |
 | `<MODEL_NAME>` | Served model name for the API | `my-model` |
-| `<TP_SIZE>` | Tensor parallel size (= number of NeuronCores) | `2` |
-| `<MAX_MODEL_LEN>` | Maximum sequence length | `2048` |
+| `<TP_SIZE>` | Tensor parallel size (= number of NeuronCores) | `2` (dense) / `12` (MoE on inf2.24xlarge) |
+| `<MAX_MODEL_LEN>` | Maximum sequence length | `2048` (dense) / `16384` (MoE) |
+| `<MAX_NUM_SEQS>` | Maximum concurrent sequences | `4` (dense) / `16` (MoE, minimum for Qwen3 MoE) |
+| `<BLOCK_SIZE>` | vLLM block size | `8` (dense) / `32` (MoE) |
 | `<HF_TOKEN>` | HuggingFace token (only for gated models) | `hf_abc123...` |
 
 ---
@@ -308,6 +325,8 @@ Use a Kubernetes Job to download model weights from HuggingFace into the PVC. Th
 
 **For public (non-gated) models:**
 
+> **Note**: The `python:3.11-slim` image runs under OpenShift's restricted SCC with a random UID. The `HOME=/tmp` and `PYTHONUSERBASE=/tmp/.local` workaround avoids `Permission denied` errors when installing pip packages. For large MoE models (~61 GB+), set resource requests and PVC size appropriately (e.g., `200Gi`).
+
 ```bash
 cat <<EOF | oc apply -f -
 apiVersion: batch/v1
@@ -316,21 +335,43 @@ metadata:
   name: download-model
   namespace: <NAMESPACE>
 spec:
+  backoffLimit: 3
   template:
     spec:
-      nodeSelector:
-        node.kubernetes.io/instance-type: <INSTANCE_TYPE>
+      restartPolicy: OnFailure
       containers:
       - name: downloader
         image: python:3.11-slim
+        resources:
+          requests:
+            cpu: "4"
+            memory: "8Gi"
+          limits:
+            cpu: "8"
+            memory: "16Gi"
         command:
         - /bin/bash
         - -c
         - |
-          pip install huggingface_hub
-          python -m huggingface_hub.commands.hf_cli download \
-            <MODEL_REPO> \
-            --local-dir /models/<MODEL_DIR>
+          set -e
+          export HOME=/tmp
+          export PYTHONUSERBASE=/tmp/.local
+          export PATH=/tmp/.local/bin:\$PATH
+
+          pip install --user huggingface_hub
+
+          python3 -c "
+          from huggingface_hub import snapshot_download
+          snapshot_download(
+              repo_id='<MODEL_REPO>',
+              local_dir='/models/<MODEL_DIR>',
+              ignore_patterns=['*.gguf', '*.md', '.gitattributes']
+          )
+          print('Download complete.')
+          "
+
+          ls -lh /models/<MODEL_DIR>/
+          echo "Model files downloaded successfully."
         volumeMounts:
         - name: model-storage
           mountPath: /models
@@ -338,8 +379,6 @@ spec:
       - name: model-storage
         persistentVolumeClaim:
           claimName: <PVC_NAME>
-      restartPolicy: Never
-  backoffLimit: 2
 EOF
 ```
 
@@ -415,7 +454,11 @@ This is the core deployment. We use a standard OpenShift `Deployment` (not a KSe
 - KServe mounts PVCs as **read-only**, but the Neuron compiler writes compiled model artifacts during first startup
 - A direct Deployment gives full control over volume mounts, environment variables, and scheduling
 
-#### 9a. Create the Deployment
+Choose **9a (Dense)** for standard models (Llama, Mistral, Qwen3 dense) or **9a (MoE)** for Mixture-of-Experts models (Qwen3-Coder, Qwen3-235B-A22B).
+
+#### 9a. Create the Deployment — Dense Models
+
+For dense (non-MoE) models on `inf2.xlarge` or `inf2.8xlarge`:
 
 ```bash
 cat <<EOF | oc apply -f -
@@ -441,7 +484,7 @@ spec:
         node.kubernetes.io/instance-type: <INSTANCE_TYPE>
       containers:
       - name: vllm-neuron
-        image: public.ecr.aws/neuron/pytorch-inference-vllm-neuronx:0.13.0-neuronx-py312-sdk2.27.1-ubuntu24.04
+        image: public.ecr.aws/neuron/pytorch-inference-vllm-neuronx:0.13.0-neuronx-py312-sdk2.28.0-ubuntu24.04
         command:
         - python
         - -m
@@ -503,7 +546,7 @@ spec:
 EOF
 ```
 
-**Key configuration details:**
+**Key configuration details (Dense):**
 
 | Parameter | Value | Explanation |
 |-----------|-------|-------------|
@@ -517,6 +560,198 @@ EOF
 | `model-storage` volume | PVC (read-write) | Model files. Must be read-write for Neuron to write compilation artifacts. |
 
 > **First startup takes 15–45+ minutes** as the Neuron compiler compiles the model for your specific NeuronCore configuration. Monitor progress with `oc logs -f deployment/vllm-neuron`.
+
+#### 9a (alt). Create the Deployment — MoE Models
+
+For Mixture-of-Experts models (e.g., Qwen3-Coder-30B-A3B-Instruct) on `inf2.24xlarge` or `inf2.48xlarge`. MoE models require the NxD Inference framework, explicit MoE parallelism configuration, and a minimum batch size of 16.
+
+**Step 1: Create the Neuron override ConfigMap**
+
+This ConfigMap contains the MoE-specific Neuron configuration. Adjust `tp_degree` and expert parallelism to match your instance type. The constraint `moe_tp_degree × moe_ep_degree = tp_degree` must hold.
+
+```bash
+cat <<'EOF' | oc apply -f -
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: vllm-neuron-config
+  namespace: <NAMESPACE>
+data:
+  neuron-config.json: |
+    {
+      "override_neuron_config": {
+        "tp_degree": 12,
+        "moe_tp_degree": 1,
+        "moe_ep_degree": 12,
+        "batch_size": 16,
+        "ctx_batch_size": 1,
+        "max_context_length": 16384,
+        "seq_len": 16384,
+        "is_continuous_batching": true,
+        "fused_qkv": true,
+        "use_index_calc_kernel": true,
+        "moe_mask_padded_tokens": true,
+        "blockwise_matmul_config": {
+          "use_shard_on_intermediate_dynamic_while": true,
+          "skip_dma_token": true
+        },
+        "enable_bucketing": true,
+        "context_encoding_buckets": [4096, 8192, 16384],
+        "token_generation_buckets": [4096, 8192, 16384],
+        "flash_decoding_enabled": false,
+        "sequence_parallel_enabled": true,
+        "qkv_kernel_enabled": true,
+        "qkv_nki_kernel_enabled": true,
+        "qkv_cte_nki_kernel_fuse_rope": true,
+        "attn_kernel_enabled": true,
+        "async_mode": true,
+        "on_device_sampling_config": {
+          "do_sample": true,
+          "temperature": 0.7,
+          "top_k": 20,
+          "top_p": 0.8
+        }
+      }
+    }
+EOF
+```
+
+> **Adjusting for `inf2.48xlarge`** (24 NeuronCores): Set `tp_degree: 24`, `moe_tp_degree: 2`, `moe_ep_degree: 12`, `attention_dp_degree: 2`, and increase `max_context_length`/`seq_len` to `32768`. Add `strided_context_parallel_kernel_enabled: true`.
+
+**Step 2: Create the MoE Deployment**
+
+```bash
+cat <<'EOF' | oc apply -f -
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllm-neuron
+  namespace: <NAMESPACE>
+  labels:
+    app: vllm-neuron
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: vllm-neuron
+  template:
+    metadata:
+      labels:
+        app: vllm-neuron
+    spec:
+      schedulerName: neuron-scheduler
+      nodeSelector:
+        node.kubernetes.io/instance-type: <INSTANCE_TYPE>
+      tolerations:
+        - key: aws.amazon.com/neuron
+          operator: Exists
+          effect: NoSchedule
+      containers:
+      - name: vllm-neuron
+        image: public.ecr.aws/neuron/pytorch-inference-vllm-neuronx:0.13.0-neuronx-py312-sdk2.28.0-ubuntu24.04
+        ports:
+        - containerPort: 8080
+          name: http
+          protocol: TCP
+        env:
+        - name: VLLM_NEURON_FRAMEWORK
+          value: "neuronx-distributed-inference"
+        - name: NEURON_COMPILE_CACHE_URL
+          value: "/mnt/models/neuron-cache"
+        - name: NEURON_COMPILED_ARTIFACTS
+          value: "/mnt/models/neuron-cache/compiled"
+        - name: HF_HOME
+          value: "/tmp/hf-home"
+        command:
+        - /bin/bash
+        - -c
+        - |
+          mkdir -p /mnt/models/neuron-cache/compiled /tmp/hf-home
+
+          NEURON_CONFIG=$(cat /config/neuron-config.json)
+
+          vllm serve \
+            --model="/mnt/models/<MODEL_DIR>" \
+            --served-model-name="<MODEL_NAME>" \
+            --tensor-parallel-size=<TP_SIZE> \
+            --max-num-seqs=<MAX_NUM_SEQS> \
+            --max-model-len=<MAX_MODEL_LEN> \
+            --block-size=<BLOCK_SIZE> \
+            --num-gpu-blocks-override=<MAX_NUM_SEQS> \
+            --additional-config="${NEURON_CONFIG}" \
+            --no-enable-chunked-prefill \
+            --no-enable-prefix-caching \
+            --port=8080
+        resources:
+          requests:
+            cpu: "64"
+            memory: 256Gi
+            aws.amazon.com/neuroncore: "<TP_SIZE>"
+          limits:
+            cpu: "96"
+            memory: 384Gi
+            aws.amazon.com/neuroncore: "<TP_SIZE>"
+        securityContext:
+          capabilities:
+            add:
+            - IPC_LOCK
+            - SYS_ADMIN
+        volumeMounts:
+        - name: model-storage
+          mountPath: /mnt/models
+        - name: neuron-config
+          mountPath: /config
+        - name: dshm
+          mountPath: /dev/shm
+        readinessProbe:
+          httpGet:
+            path: /v1/models
+            port: 8080
+          initialDelaySeconds: 1800
+          periodSeconds: 30
+          timeoutSeconds: 10
+          failureThreshold: 60
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 2400
+          periodSeconds: 60
+          timeoutSeconds: 10
+          failureThreshold: 10
+      volumes:
+      - name: model-storage
+        persistentVolumeClaim:
+          claimName: <PVC_NAME>
+          readOnly: false
+      - name: neuron-config
+        configMap:
+          name: vllm-neuron-config
+      - name: dshm
+        emptyDir:
+          medium: Memory
+          sizeLimit: 16Gi
+EOF
+```
+
+**Key configuration details (MoE):**
+
+| Parameter | Value | Explanation |
+|-----------|-------|-------------|
+| `VLLM_NEURON_FRAMEWORK` | `neuronx-distributed-inference` | **Required** for MoE models. Enables the NxD Inference library. |
+| `--additional-config` | JSON with `override_neuron_config` | Passes MoE parallelism, bucketing, and kernel flags to the Neuron compiler. |
+| `--tensor-parallel-size` | `<TP_SIZE>` | Must equal total NeuronCores. `inf2.24xlarge` = 12, `inf2.48xlarge` = 24. |
+| `--max-num-seqs` | `16` | Minimum for Qwen3 MoE (batch_size >= 16 is a hard requirement). |
+| `--block-size` | `32` | Required block size for MoE models on Neuron. |
+| `--num-gpu-blocks-override` | `16` | Must match `--max-num-seqs` when chunked prefill and prefix caching are off. |
+| `--no-enable-chunked-prefill` | — | Chunked prefill is not supported on Neuron. |
+| `--no-enable-prefix-caching` | — | Disable for MoE models on Neuron. |
+| `schedulerName` | `neuron-scheduler` | Neuron's topology-aware scheduler for optimal NeuronCore placement. |
+| `NEURON_COMPILE_CACHE_URL` | `/mnt/models/neuron-cache` | Persistent cache on the PVC — survives pod restarts. |
+| `NEURON_COMPILED_ARTIFACTS` | `/mnt/models/neuron-cache/compiled` | Explicit path for pre-compiled traced model artifacts. |
+| `/dev/shm` volume | `emptyDir: Memory, 16Gi` | Shared memory for inter-process communication during MoE inference. |
+
+> **First startup takes 30–60+ minutes** for MoE models as the Neuron compiler compiles expert routing, attention, and FFN graphs. The `readinessProbe` is configured with a 30-minute initial delay and the `livenessProbe` with 40 minutes to accommodate this. Monitor progress with `oc logs -f deployment/vllm-neuron`.
 
 #### 9b. Create the Service
 
@@ -785,8 +1020,8 @@ spec:
   multiModel: false
   containers:
     - name: kserve-container
-      image: public.ecr.aws/neuron/pytorch-inference-vllm-neuronx:0.13.0-neuronx-py312-sdk2.27.1-ubuntu24.04
-      command:
+      image: public.ecr.aws/neuron/pytorch-inference-vllm-neuronx:0.13.0-neuronx-py312-sdk2.28.0-ubuntu24.04
+        command:
         - python
         - -m
         - vllm.entrypoints.openai.api_server
@@ -1049,8 +1284,8 @@ spec:
   multiModel: false
   containers:
     - name: kserve-container
-      image: public.ecr.aws/neuron/pytorch-inference-vllm-neuronx:0.13.0-neuronx-py312-sdk2.27.1-ubuntu24.04
-      command:
+      image: public.ecr.aws/neuron/pytorch-inference-vllm-neuronx:0.13.0-neuronx-py312-sdk2.28.0-ubuntu24.04
+        command:
         - python
         - -m
         - vllm.entrypoints.openai.api_server
@@ -1453,6 +1688,59 @@ KServe remains valuable for multi-model serving, canary rollouts, and autoscalin
 | **Startup with NEFF cache** | ~2-3 minutes |
 | **Inference latency** | ~2 seconds for 30 tokens |
 | **Storage** | Model on PVC (EBS gp3), NEFF cache on PVC (EBS gp3), both backed up to S3 |
+
+---
+
+## Future Improvements Required
+
+The following items represent gaps in the current Inferentia2 + OpenShift AI integration that need to be addressed for full parity with NVIDIA GPU-based deployments.
+
+### 1. OpenShift AI Dashboard — Model Deployments Not Visible
+
+**Problem:** Models deployed on Inferentia2 using a plain Kubernetes `Deployment` + `Service` + `Route` do not appear in the OpenShift AI dashboard under **Deployments**. The dashboard only discovers models deployed as KServe `InferenceService` + `ServingRuntime` pairs.
+
+**Root cause:** OpenShift AI's dashboard queries the KServe API (`serving.kserve.io/v1beta1 InferenceService`) to populate the Deployments page, not the core `apps/v1 Deployment` API. Our Inferentia2 deployments bypass KServe because the Neuron compiler needs writable volume mounts during first startup, which conflicts with KServe's read-only PVC handling.
+
+**Path forward:** Create a custom `ServingRuntime` for vLLM-Neuron (modeled after the existing `vllm-cuda-runtime-template`) and wire up the deployment as a KServe `InferenceService` with `serving.kserve.io/deploymentMode: RawDeployment`. This requires validating that KServe correctly propagates the `IPC_LOCK`/`SYS_ADMIN` security capabilities, the `neuron-scheduler` schedulerName, NeuronCore resource requests, and the MoE-specific `--additional-config` flags. See Section 3 (Approaches A/B/C) for the KServe integration patterns.
+
+### 2. OpenShift AI Dashboard — Workbench Images Not Showing
+
+**Problem:** Custom workbench images registered as ImageStreams in `redhat-ods-applications` with the `opendatahub.io/notebook-image: "true"` label do not appear in **Environment Setup > Workbench Images** in the OpenShift AI 3.3 dashboard.
+
+**Root cause:** The dashboard requires additional labels and annotations beyond the documented `opendatahub.io/notebook-image` label to discover and display workbench images. The operator-managed images (e.g., `code-server-notebook`, `pytorch`) carry the following metadata that custom images typically lack:
+
+**Required labels:**
+- `app.kubernetes.io/part-of: workbenches`
+- `app.opendatahub.io/workbenches: "true"`
+- `component.opendatahub.io/name: notebooks`
+- `opendatahub.io/component: "true"`
+- `platform.opendatahub.io/part-of: workbenches`
+
+**Required annotations:**
+- `platform.opendatahub.io/instance.name: default-workbenches`
+- `platform.opendatahub.io/instance.uid: <Workbenches CR UID>`
+- `platform.opendatahub.io/instance.generation: "1"`
+- `platform.opendatahub.io/type: "OpenShift AI Self-Managed"`
+- `platform.opendatahub.io/version: "3.3.0"`
+
+**Status:** Adding these labels and annotations was tested but the image still did not appear in the Workbench Images admin page. The dashboard may use additional filtering logic (e.g., only showing images imported through the dashboard's own import flow, or filtering on the `platform.opendatahub.io/instance.uid` matching an expected controller UID). Further investigation into the RHOAI dashboard frontend code is needed. As a workaround, the custom workbench image may still appear in the **workbench creation dropdown** when creating a workbench inside a Data Science Project.
+
+### 3. OpenShift AI Dashboard — No Neuron Serving Runtime
+
+**Problem:** The **Model Resources and Operations > Serving Runtimes** page has no serving runtime for Neuron-based inference. The pre-installed runtimes cover NVIDIA GPUs (`vllm-cuda-runtime-template`), AMD GPUs (`vllm-rocm-runtime-template`), Intel Gaudi (`vllm-gaudi-runtime-template`), IBM Spyre, and CPU-only — but there is no `vllm-neuron-runtime-template`.
+
+**Root cause:** Red Hat has not yet shipped a Neuron-specific serving runtime template in OpenShift AI 3.3. The Neuron integration exists at the infrastructure level (NFD, KMM, Neuron Operator, HardwareProfile) but the model serving layer (KServe ServingRuntime template) has not been created.
+
+**Path forward:** Create a custom `Template` in `redhat-ods-applications` containing a `ServingRuntime` for vLLM-Neuron, modeled after the `vllm-cuda-runtime-template`. Key differences from the CUDA template:
+- Container image: `public.ecr.aws/neuron/pytorch-inference-vllm-neuronx:0.13.0-neuronx-py312-sdk2.28.0-ubuntu24.04`
+- Environment variable: `VLLM_NEURON_FRAMEWORK=neuronx-distributed-inference` (for MoE models)
+- Security capabilities: `IPC_LOCK` and `SYS_ADMIN`
+- Resource type: `aws.amazon.com/neuroncore` instead of `nvidia.com/gpu`
+- Recommended accelerators annotation: `'["aws.amazon.com/neuroncore"]'`
+- Additional volumes: `/dev/shm` emptyDir for shared memory, Neuron cache volume
+- Template labels: `opendatahub.io/dashboard: "true"`, `opendatahub.io/ootb: "true"` for dashboard discovery
+
+This template would need testing with the KServe `InferenceService` workflow to confirm that all Neuron-specific requirements (scheduler, capabilities, MoE config) are correctly propagated.
 
 ---
 
