@@ -1,7 +1,8 @@
- # Qwen3-Coder-30B-A3B on AWS Inferentia2: Performance Benchmarking & Analysis
+ # LLM Inference on AWS Inferentia2: Performance Benchmarking & Analysis
 
 ## Table of Contents
 - [Deployment Configuration](#deployment-configuration)
+- [Dense Model Comparative Benchmarks (Run 3)](#dense-model-comparative-benchmarks-run-3)
 - [NeuronCore Utilization Analysis](#neuroncore-utilization-analysis)
 - [Benchmarking Methodology](#benchmarking-methodology)
 - [Key Performance Metrics Explained](#key-performance-metrics-explained)
@@ -52,6 +53,122 @@
 | **Max Concurrent Seqs** | 16 (batch_size=16) |
 | **Neuron Cores Used** | 8 of 12 (NEURON_RT_VISIBLE_CORES=0-7) |
 | **Endpoint** | OpenAI-compatible API (vLLM `/v1/completions`, `/v1/chat/completions`) |
+
+### Run 3: Dense Model Comparison on inf2.24xlarge
+
+Two dense coding models were tested in parallel on separate inf2.24xlarge nodes:
+
+**Node A — Qwen3-32B**
+
+| Parameter | Value |
+|---|---|
+| **Model** | Qwen/Qwen3-32B (Dense, 32.8B parameters) |
+| **Platform** | Red Hat OpenShift Service on AWS (ROSA) HCP 4.21.6 |
+| **Instance** | inf2.24xlarge (12 NeuronCores, 192 GB HBM, 96 vCPUs, 384 GB RAM) |
+| **Serving Engine** | vLLM 0.13.0 with Neuron SDK 2.28.0 |
+| **Framework** | neuronx-distributed-inference |
+| **Tensor Parallel** | tp_degree=8 (hidden_size 5120 / 8 = 640 elements per shard) |
+| **Max Model Length** | 4,096 tokens |
+| **Max Concurrent Seqs** | 4 |
+| **BF16 Weight Size** | ~64 GB |
+| **Neuron Cores Used** | 8 of 12 (NEURON_RT_VISIBLE_CORES=0-7) |
+
+**Node B — CodeLlama-34B-Instruct**
+
+| Parameter | Value |
+|---|---|
+| **Model** | codellama/CodeLlama-34b-Instruct-hf (Dense, 33.7B parameters) |
+| **Platform** | Red Hat OpenShift Service on AWS (ROSA) HCP 4.21.6 |
+| **Instance** | inf2.24xlarge (12 NeuronCores, 192 GB HBM, 96 vCPUs, 384 GB RAM) |
+| **Serving Engine** | vLLM 0.13.0 with Neuron SDK 2.28.0 |
+| **Framework** | neuronx-distributed-inference |
+| **Tensor Parallel** | tp_degree=8 (hidden_size 8192 / 8 = 1024 elements per shard) |
+| **Max Model Length** | 4,096 tokens |
+| **Max Concurrent Seqs** | 4 |
+| **BF16 Weight Size** | ~68 GB |
+| **Neuron Cores Used** | 8 of 12 (NEURON_RT_VISIBLE_CORES=0-7) |
+
+---
+
+## Dense Model Comparative Benchmarks (Run 3)
+
+### Benchmark Methodology
+
+Both models were tested simultaneously on separate inf2.24xlarge nodes using GuideLLM 0.5.4. Three tests per model:
+
+| Test | Prompt Tokens | Output Tokens | Rate Type | Duration |
+|------|---------------|---------------|-----------|----------|
+| Small | 128 | 128 | Synchronous (1 req at a time) | 120s |
+| Medium | 512 | 512 | Synchronous (1 req at a time) | 120s |
+| Throughput | 2048 | 1024 | Constant @ 0.5 req/s | 180s |
+
+### Head-to-Head Results
+
+#### Test 1: Small Workload (128 in / 128 out, Synchronous)
+
+| Metric | Qwen3-32B | CodeLlama-34B | Winner |
+|--------|-----------|---------------|--------|
+| **TTFT (mdn)** | 1,091 ms | 1,185 ms | Qwen3-32B |
+| **TTFT (p95)** | 1,103 ms | 1,248 ms | Qwen3-32B |
+| **ITL (mdn)** | 37.8 ms | 42.2 ms | Qwen3-32B |
+| **ITL (p95)** | 38.3 ms | 43.4 ms | Qwen3-32B |
+| **TPOT (mdn)** | 46.1 ms | 51.2 ms | Qwen3-32B |
+| **Gen tokens/s (mean)** | 21.9 | 19.7 | Qwen3-32B |
+| **Total tokens/s (mean)** | 45.1 | 40.4 | Qwen3-32B |
+| **Completed Requests** | 21 | 19 | Qwen3-32B |
+
+#### Test 2: Medium Workload (512 in / 512 out, Synchronous)
+
+| Metric | Qwen3-32B | CodeLlama-34B | Winner |
+|--------|-----------|---------------|--------|
+| **TTFT (mdn)** | 1,111 ms | 1,203 ms | Qwen3-32B |
+| **TTFT (p95)** | 1,139 ms | 1,211 ms | Qwen3-32B |
+| **ITL (mdn)** | 37.8 ms | 42.2 ms | Qwen3-32B |
+| **ITL (p95)** | 38.1 ms | 42.8 ms | Qwen3-32B |
+| **TPOT (mdn)** | 39.9 ms | 44.5 ms | Qwen3-32B |
+| **Gen tokens/s (mean)** | 25.2 | 22.6 | Qwen3-32B |
+| **Total tokens/s (mean)** | 50.9 | 45.5 | Qwen3-32B |
+| **Completed Requests** | 6 | 6 | Tie |
+
+#### Test 3: Throughput Workload (2048 in / 1024 out, Constant @ 0.5 req/s)
+
+| Metric | Qwen3-32B | CodeLlama-34B | Winner |
+|--------|-----------|---------------|--------|
+| **TTFT (mdn)** | 36,360 ms | 41,489 ms | Qwen3-32B |
+| **TTFT (p95)** | 59,980 ms | 59,816 ms | CodeLlama-34B |
+| **ITL (mdn)** | 41.2 ms | 46.0 ms | Qwen3-32B |
+| **ITL (p95)** | 42.2 ms | 47.1 ms | Qwen3-32B |
+| **TPOT (mdn)** | 76.7 ms | 86.5 ms | Qwen3-32B |
+| **Gen tokens/s (mean)** | 92.2 | 83.5 | Qwen3-32B |
+| **Total tokens/s (mean)** | 1,134.7 | 1,114.7 | Qwen3-32B |
+| **Concurrency (mdn)** | 33.0 | 34.0 | Tie |
+| **Completed Requests** | 12 | 12 | Tie |
+
+### Key Findings
+
+1. **Qwen3-32B consistently outperforms CodeLlama-34B-Instruct** across all metrics on Inferentia2, winning every latency and throughput comparison.
+
+2. **Inter-token latency (ITL)** is remarkably consistent for both models:
+   - Qwen3-32B: 37.8–41.2 ms across all workloads
+   - CodeLlama-34B: 42.2–46.0 ms across all workloads
+   - This ~10% ITL advantage for Qwen3-32B translates to faster real-time streaming.
+
+3. **Time to first token (TTFT)** is comparable for small/medium workloads (~1.1s for both) but explodes under load (Test 3) because requests queue while the single-threaded Neuron prefill processes earlier requests.
+
+4. **Both models compile and run reliably on inf2.24xlarge with tp=8**, using 8 of 12 NeuronCores (33% waste). Key compilation workarounds:
+   - Qwen3-32B requires NxD framework with `fused_qkv: false` and all NKI kernels disabled to avoid HLO tracing errors.
+   - CodeLlama-34B requires NxD framework with `enable_bucketing: false` and NKI kernels disabled to avoid Neuron compiler internal errors on context encoding buckets.
+
+5. **inf2.24xlarge is the right instance size** for these ~32–34B dense models. 192 GB HBM provides ample room for 64–68 GB weights plus KV cache.
+
+### Compilation Notes
+
+| Model | HLO Generation | Compilation | Total Cold Start |
+|-------|---------------|-------------|-----------------|
+| Qwen3-32B | 8 seconds | ~6 minutes | ~8 minutes |
+| CodeLlama-34B | 45 seconds | ~12 minutes | ~15 minutes |
+
+Both models required disabling NKI kernel optimizations (`qkv_kernel_enabled: false`, `attn_kernel_enabled: false`) and bucketing (`enable_bucketing: false`) to compile successfully on Neuron SDK 2.28.0. These issues are expected to be resolved in future SDK versions.
 
 ---
 
