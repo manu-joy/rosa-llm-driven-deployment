@@ -1,7 +1,8 @@
-# Qwen3-Coder-30B-A3B on AWS Inferentia2: Performance Benchmarking & Analysis
+ # Qwen3-Coder-30B-A3B on AWS Inferentia2: Performance Benchmarking & Analysis
 
 ## Table of Contents
 - [Deployment Configuration](#deployment-configuration)
+- [NeuronCore Utilization Analysis](#neuroncore-utilization-analysis)
 - [Benchmarking Methodology](#benchmarking-methodology)
 - [Key Performance Metrics Explained](#key-performance-metrics-explained)
 - [Benchmark Test Configurations](#benchmark-test-configurations)
@@ -15,6 +16,27 @@
 ---
 
 ## Deployment Configuration
+
+### Run 2: inf2.48xlarge (Current)
+
+| Parameter | Value |
+|---|---|
+| **Model** | Qwen3-Coder-30B-A3B-Instruct (MoE: 30.5B total, 3.3B active/token) |
+| **Platform** | Red Hat OpenShift Service on AWS (ROSA) HCP 4.21.6 |
+| **Instance** | inf2.48xlarge (24 NeuronCores, 384 GB HBM, 192 vCPUs, 768 GB RAM) |
+| **Accelerator** | AWS Inferentia2 (12 Inferentia2 chips, 24 NeuronCores) |
+| **Serving Engine** | vLLM 0.13.0 with Neuron SDK 2.28.0 |
+| **Container Image** | `public.ecr.aws/neuron/pytorch-inference-vllm-neuronx:0.13.0-neuronx-py312-sdk2.28.0-ubuntu24.04` (19.0 GB) |
+| **Framework** | neuronx-distributed-inference |
+| **Tensor Parallel** | tp_degree=16 (hidden_size 2048 / 16 = 128 elements per shard) |
+| **MoE Config** | moe_tp_degree=2, moe_ep_degree=8 (128 experts, 8 active/token) |
+| **Max Model Length** | 16,384 tokens |
+| **Max Concurrent Seqs** | 16 (batch_size=16) |
+| **Neuron Cores Used** | 16 of 24 (NEURON_RT_VISIBLE_CORES=0-15) |
+| **Scheduler** | neuron-scheduler (topology-aware contiguous core allocation) |
+| **Endpoint** | OpenAI-compatible API (vLLM `/v1/completions`, `/v1/chat/completions`) |
+
+### Run 1: inf2.24xlarge (Previous)
 
 | Parameter | Value |
 |---|---|
@@ -30,6 +52,141 @@
 | **Max Concurrent Seqs** | 16 (batch_size=16) |
 | **Neuron Cores Used** | 8 of 12 (NEURON_RT_VISIBLE_CORES=0-7) |
 | **Endpoint** | OpenAI-compatible API (vLLM `/v1/completions`, `/v1/chat/completions`) |
+
+---
+
+## Container & Model Weight Architecture
+
+### Component Sizes
+
+| Component | Size | Storage Type | Cost |
+|---|---|---|---|
+| **vLLM Runtime Container** | 19.0 GB | ECR → CRI-O image cache on node | Pull time: ~2 min |
+| **Qwen3-Coder-30B-A3B weights** | 57 GB | EBS PVC (gp3, 500 GB RWO) | $0.08/GB/month |
+| **Qwen2.5-Coder-32B weights** | 62 GB | EBS PVC (same volume) | Included above |
+| **Neuron compilation cache** | ~20-40 GB/model | EBS PVC (same volume) | Included above |
+| **Total EBS footprint** | ~200 GB used / 500 GB provisioned | EBS gp3 | $40/month |
+
+### Model Weight Decoupling
+
+Model weights are **decoupled from the container image**. The 19 GB runtime image contains only the vLLM engine, PyTorch, and Neuron SDK. Model files are loaded at startup from a PersistentVolumeClaim mounted at `/mnt/models`.
+
+### Current Limitations (EBS-based PVC)
+
+| Issue | Impact |
+|---|---|
+| **ReadWriteOnce** | Only one pod on one node can mount the volume simultaneously |
+| **Scaling penalty** | Adding a second inf2 node requires a new PVC + model re-download (~10 min for 57 GB) |
+| **Cold start** | Node replacement → EBS detach/attach + model recompilation = 30-60 min |
+| **Over-provisioned** | Paying for 500 GB even though only ~200 GB is used |
+
+### Recommended: S3 for Model Weights (Production Architecture)
+
+For production deployments, model weights should be stored in Amazon S3 and accessed via either:
+1. **Mountpoint for Amazon S3 CSI driver** — mounts S3 bucket as a POSIX filesystem
+2. **Init container with `aws s3 sync`** — downloads weights from S3 to a local emptyDir at pod startup
+
+| Metric | EBS gp3 (Current) | S3 (Recommended) |
+|---|---|---|
+| **Storage cost** | $0.08/GB/month ($40/mo for 500 GB) | $0.023/GB/month ($4.60/mo for 200 GB) |
+| **Multi-node access** | No (RWO) | Yes (ReadWriteMany) |
+| **Scale-out penalty** | 10+ min (new PVC + download) | 0 (shared bucket, or parallel S3 sync) |
+| **Pre-allocation** | Required (500 GB upfront) | None (pay for what you store) |
+| **Read throughput** | 1 GB/s (gp3 max) | 100+ Gbps (S3 multi-part) |
+| **Write support** | Full POSIX | Append-only (Mountpoint) or S3 API |
+
+**Compilation cache** should remain on EBS (small, write-heavy, per-node) or be pre-compiled and stored in S3 for instant startup.
+
+---
+
+## NeuronCore Utilization Analysis
+
+### Why Not All NeuronCores Are Usable
+
+The `inf2.48xlarge` has **24 NeuronCores** (12 Inferentia2 chips × 2 cores each), but only **16 cores** are used for this model. The `inf2.24xlarge` has **12 NeuronCores** but only **8** are used. This is a fundamental constraint of **tensor parallelism divisibility**.
+
+### The Constraint
+
+Tensor parallelism (TP) shards model weight matrices across NeuronCores. The `tp_degree` must **evenly divide** the model's `hidden_size`, `num_attention_heads`, and `num_key_value_heads`. For Qwen3-Coder-30B-A3B-Instruct:
+
+| Model Dimension | Value |
+|---|---|
+| `hidden_size` | 2048 |
+| `num_attention_heads` | 16 |
+| `num_key_value_heads` | 4 |
+| `num_experts` | 128 |
+| `num_experts_per_tok` | 8 |
+
+### Divisibility Check Against Available Core Counts
+
+| tp_degree | 2048 / tp | 16 / tp | 4 / tp | Valid? | Notes |
+|---|---|---|---|---|---|
+| **24** | 85.33 | 0.67 | 0.17 | **No** | Cannot use all cores on inf2.48xlarge |
+| **16** | 128 | 1 | 0.25 | **Yes** | KV heads replicated via GQA (4 heads → 4 replicas per TP group) |
+| **12** | 170.67 | 1.33 | 0.33 | **No** | Cannot use all cores on inf2.24xlarge |
+| **8** | 256 | 2 | 0.5 | **Yes** | KV heads replicated via GQA (4 heads → 2 replicas per TP group) |
+| **4** | 512 | 4 | 1 | **Yes** | Clean division on all dimensions |
+| **2** | 1024 | 8 | 2 | **Yes** | Minimal parallelism |
+
+The TP degree must be a **power of 2** to divide the model's hidden dimensions (which are themselves powers of 2 in virtually all modern LLMs). Since 24 and 12 are not powers of 2, neither `inf2.48xlarge` (24 cores) nor `inf2.24xlarge` (12 cores) can use all their NeuronCores with this model.
+
+### MoE Expert Parallelism (EP) Doesn't Help
+
+The MoE layers add expert parallelism (`moe_ep_degree`) as another sharding axis. The total NeuronCores used equals `moe_tp_degree × moe_ep_degree`. For Qwen3-Coder with 128 experts and 8 active per token:
+
+| Configuration | moe_tp × moe_ep | Total Cores | Fits 24? | Fits 12? |
+|---|---|---|---|---|
+| tp=2, ep=8 | 2 × 8 = 16 | 16 | No (8 idle) | No (too many) |
+| tp=4, ep=8 | 4 × 8 = 32 | 32 | No (exceeds) | No (exceeds) |
+| tp=1, ep=8 | 1 × 8 = 8 | 8 | No (16 idle) | No (4 idle) |
+| tp=2, ep=12 | 2 × 12 = 24 | 24 | **Yes** | No |
+| tp=1, ep=12 | 1 × 12 = 12 | 12 | No | **Yes** |
+
+In theory, `moe_ep_degree=12` could use all 24 cores on `inf2.48xlarge`, but:
+- The EP degree must evenly divide the number of experts: 128 / 12 = 10.67 — **not an integer**
+- Valid EP degrees for 128 experts: 1, 2, 4, 8, 16, 32, 64, 128 (powers of 2)
+- So the MoE architecture of this model also prevents using 12 or 24 cores
+
+### Resource Waste by Instance Type
+
+| Instance | Total Cores | Max Usable (tp_degree) | Idle Cores | Waste % | On-Demand $/hr |
+|---|---|---|---|---|---|
+| **inf2.xlarge** | 2 | 2 (tp=2) | 0 | 0% | $0.76 |
+| **inf2.8xlarge** | 2 | 2 (tp=2) | 0 | 0% | $1.97 |
+| **inf2.24xlarge** | 12 | 8 (tp=8) | 4 | 33% | $6.49 |
+| **inf2.48xlarge** | 24 | 16 (tp=16) | 8 | 33% | $12.98 |
+
+Both the 12-core and 24-core Inferentia2 instances waste exactly 33% of their NeuronCores for this model.
+
+### Effective Cost Per Usable Core
+
+| Instance | Total Cores | Usable Cores | $/hr (OD) | $/hr per Usable Core |
+|---|---|---|---|---|
+| inf2.xlarge | 2 | 2 | $0.76 | $0.380 |
+| inf2.8xlarge | 2 | 2 | $1.97 | $0.985 |
+| inf2.24xlarge | 12 | 8 | $6.49 | $0.811 |
+| inf2.48xlarge | 24 | 16 | $12.98 | $0.811 |
+
+The `inf2.24xlarge` and `inf2.48xlarge` have identical per-usable-core cost ($0.811/hr), so the choice between them depends on whether you need `tp=16` (for higher context length and throughput) or `tp=8` is sufficient.
+
+### Strategies to Reclaim Idle Cores
+
+| Strategy | Description | Feasibility |
+|---|---|---|
+| **Co-locate a second model** | Run a smaller model (e.g., embedding, routing, or code completion) on idle cores using `NEURON_RT_VISIBLE_CORES=16-23` | **High** — requires a second vLLM deployment with separate core range |
+| **Use a model with compatible dimensions** | Choose a model where `hidden_size % 24 = 0` (e.g., hidden_size=3072 or 4608) | **Medium** — limited model choices |
+| **Use inf2.xlarge/8xlarge instances** | Zero waste (2 cores, tp=2), but only viable for very small models | **Low** — insufficient for 30B parameter models |
+| **Wait for Trainium2** | Trn2.48xlarge has 32 NeuronCores (power of 2), eliminating the waste for tp=16 or tp=32 | **Future** — depends on Trn2 vLLM support maturity |
+
+### Comparison with Trainium for This Model
+
+| Instance | Chip | Cores | tp=16 Usable | tp=32 Usable | Waste (tp=16) | $/hr (OD) |
+|---|---|---|---|---|---|---|
+| inf2.48xlarge | Inferentia2 | 24 | 16 (67%) | N/A | 33% | $12.98 |
+| trn1.32xlarge | Trainium v1 | 32 | 16 (50%) | 32 (100%) | 0-50% | $21.50 |
+| trn2.48xlarge | Trainium v2 | 32 | 16 (50%) | 32 (100%) | 0-50% | ~$17.79 |
+
+Trainium instances have 32 cores (a power of 2), which enables tp=32 with zero waste. However, tp=32 requires `num_key_value_heads` (4) to be replicated 8× per core group, increasing memory bandwidth pressure. The cost-per-usable-core comparison favors Inferentia2 at tp=16 ($0.811 vs $1.11-$1.34/core), but Trainium can use all cores at tp=32 if the model's GQA replication overhead is acceptable.
 
 ---
 
@@ -108,7 +265,7 @@ Six configurations were tested to cover a range of real-world usage patterns:
 **Test 1: Small (128 in / 128 out)**
 ```bash
 guidellm benchmark run \
-  --target https://vllm-qwen3-coder-llm-serving.apps.rosa.rosa-llm-inf2.3kzm.p3.openshiftapps.com \
+  --target https://vllm-qwen3-coder-llm-serving.apps.rosa.rosa-inf2-48xl.w6qi.p3.openshiftapps.com \
   --model "Qwen3-Coder-30B-A3B-Instruct" \
   --rate-type sweep \
   --max-seconds 30 \
@@ -119,7 +276,7 @@ guidellm benchmark run \
 **Test 2: Short prompt / Medium response (128 in / 256 out)**
 ```bash
 guidellm benchmark run \
-  --target https://vllm-qwen3-coder-llm-serving.apps.rosa.rosa-llm-inf2.3kzm.p3.openshiftapps.com \
+  --target https://vllm-qwen3-coder-llm-serving.apps.rosa.rosa-inf2-48xl.w6qi.p3.openshiftapps.com \
   --model "Qwen3-Coder-30B-A3B-Instruct" \
   --rate-type sweep \
   --max-seconds 30 \
@@ -130,7 +287,7 @@ guidellm benchmark run \
 **Test 3: Balanced medium (256 in / 256 out)**
 ```bash
 guidellm benchmark run \
-  --target https://vllm-qwen3-coder-llm-serving.apps.rosa.rosa-llm-inf2.3kzm.p3.openshiftapps.com \
+  --target https://vllm-qwen3-coder-llm-serving.apps.rosa.rosa-inf2-48xl.w6qi.p3.openshiftapps.com \
   --model "Qwen3-Coder-30B-A3B-Instruct" \
   --rate-type sweep \
   --max-seconds 30 \
@@ -141,7 +298,7 @@ guidellm benchmark run \
 **Test 4: Code generation (512 in / 512 out)**
 ```bash
 guidellm benchmark run \
-  --target https://vllm-qwen3-coder-llm-serving.apps.rosa.rosa-llm-inf2.3kzm.p3.openshiftapps.com \
+  --target https://vllm-qwen3-coder-llm-serving.apps.rosa.rosa-inf2-48xl.w6qi.p3.openshiftapps.com \
   --model "Qwen3-Coder-30B-A3B-Instruct" \
   --rate-type sweep \
   --max-seconds 30 \
@@ -152,7 +309,7 @@ guidellm benchmark run \
 **Test 5: Large context code review (1024 in / 512 out)**
 ```bash
 guidellm benchmark run \
-  --target https://vllm-qwen3-coder-llm-serving.apps.rosa.rosa-llm-inf2.3kzm.p3.openshiftapps.com \
+  --target https://vllm-qwen3-coder-llm-serving.apps.rosa.rosa-inf2-48xl.w6qi.p3.openshiftapps.com \
   --model "Qwen3-Coder-30B-A3B-Instruct" \
   --rate-type sweep \
   --max-seconds 30 \
@@ -163,7 +320,7 @@ guidellm benchmark run \
 **Test 6: Large document analysis (2048 in / 1024 out)**
 ```bash
 guidellm benchmark run \
-  --target https://vllm-qwen3-coder-llm-serving.apps.rosa.rosa-llm-inf2.3kzm.p3.openshiftapps.com \
+  --target https://vllm-qwen3-coder-llm-serving.apps.rosa.rosa-inf2-48xl.w6qi.p3.openshiftapps.com \
   --model "Qwen3-Coder-30B-A3B-Instruct" \
   --rate-type sweep \
   --max-seconds 90 \
@@ -178,9 +335,129 @@ guidellm benchmark run \
 
 ## Results
 
-### GuideLLM Sweep Results
+### Run 2: inf2.48xlarge (tp=16, 16 NeuronCores) — GuideLLM Sweep Results
 
-Each test runs a 10-point sweep: 1 synchronous, 1 max-throughput, and 8 constant rate points with increasing concurrency. All benchmarks run inside the cluster (pod-to-service, no TLS overhead).
+Each test runs a 10-point sweep: 1 synchronous, 1 max-throughput, and 8 constant rate points with increasing concurrency. All benchmarks run inside the cluster (pod-to-service, no TLS overhead). Model context length: 16,384 tokens.
+
+#### Test 1: 128 prompt / 128 output tokens
+
+**Latency (Completed Requests)**
+
+| Strategy | Req Latency (Mdn/p95) | TTFT Mdn/p95 (ms) | ITL Mdn/p95 (ms) | TPOT Mdn/p95 (ms) |
+|---|---|---|---|---|
+| synchronous | 5.6s / 5.7s | 632 / 633 | 39.3 / 39.7 | 43.9 / 44.3 |
+| throughput | 29.2s / 43.7s | 19,978 / 37,547 | 76.9 / 109.8 | 227.7 / 341.7 |
+| constant (low) | 6.3s / 6.5s | 656 / 666 | 44.7 / 45.6 | 49.5 / 50.4 |
+| constant (mid) | 9.1s / 9.4s | 672 / 681 | 66.3 / 68.7 | 71.1 / 73.4 |
+| constant (high) | 15.3s / 15.5s | 662 / 910 | 115.4 / 115.5 | 119.6 / 120.9 |
+
+**Throughput (All Requests)**
+
+| Strategy | Concurrency (Mdn) | Output tok/s (Mean) | Completed Reqs |
+|---|---|---|---|
+| synchronous | 1 | 23.2 | 6 |
+| throughput | 32 | 142.5 | 48 |
+| constant (low) | 2 | 33.1 | 8 |
+| constant (mid) | 5 | 60.7 | 14 |
+| constant (high) | 9 | 72.9 | 17 |
+
+#### Test 2: 128 prompt / 256 output tokens
+
+**Latency (Completed Requests)**
+
+| Strategy | Req Latency (Mdn/p95) | TTFT Mdn/p95 (ms) | ITL Mdn/p95 (ms) | TPOT Mdn/p95 (ms) |
+|---|---|---|---|---|
+| synchronous | 10.6s / 10.7s | 632 / 632 | 39.3 / 39.3 | 41.6 / 41.6 |
+| throughput | 19.7s / 39.3s | 9,575 / 28,678 | 56.1 / 74.4 | 76.9 / 153.5 |
+| constant (low) | 11.4s / 11.5s | 649 / 674 | 42.3 / 42.3 | 44.7 / 44.8 |
+| constant (mid) | 12.7s / 12.7s | 660 / 675 | 47.1 / 47.3 | 49.6 / 49.8 |
+| constant (high) | 15.9s / 16.2s | 662 / 680 | 59.9 / 60.7 | 62.2 / 63.1 |
+
+**Throughput (All Requests)**
+
+| Strategy | Concurrency (Mdn) | Output tok/s (Mean) | Completed Reqs |
+|---|---|---|---|
+| synchronous | 1 | 24.5 | 3 |
+| throughput | 32 | 211.8 | 32 |
+| constant (low) | 1 | 28.6 | 3 |
+| constant (mid) | 3 | 53.3 | 6 |
+| constant (high) | 4 | 71.4 | 8 |
+
+#### Test 3: 256 prompt / 256 output tokens
+
+**Latency (Completed Requests)**
+
+| Strategy | Req Latency (Mdn/p95) | TTFT Mdn/p95 (ms) | ITL Mdn/p95 (ms) | TPOT Mdn/p95 (ms) |
+|---|---|---|---|---|
+| synchronous | 10.7s / 10.8s | 632 / 633 | 39.4 / 39.9 | 41.7 / 42.2 |
+| throughput | 19.6s / 39.3s | 9,573 / 28,612 | 55.9 / 74.6 | 76.7 / 153.5 |
+| constant (low) | 11.4s / 11.4s | 656 / 673 | 42.0 / 42.0 | 44.4 / 44.4 |
+| constant (mid) | 12.7s / 12.7s | 664 / 683 | 47.1 / 47.3 | 49.6 / 49.7 |
+| constant (high) | 15.9s / 16.1s | 664 / 680 | 59.8 / 60.6 | 62.2 / 62.9 |
+
+**Throughput (All Requests)**
+
+| Strategy | Concurrency (Mdn) | Output tok/s (Mean) | Completed Reqs |
+|---|---|---|---|
+| synchronous | 1 | 24.4 | 3 |
+| throughput | 32 | 211.8 | 32 |
+| constant (low) | 1 | 28.7 | 3 |
+| constant (mid) | 3 | 53.4 | 6 |
+| constant (high) | 4 | 71.5 | 8 |
+
+#### Test 4: 512 prompt / 512 output tokens
+
+**Latency (Completed Requests)**
+
+| Strategy | Req Latency (Mdn/p95) | TTFT Mdn/p95 (ms) | ITL Mdn/p95 (ms) | TPOT Mdn/p95 (ms) |
+|---|---|---|---|---|
+| synchronous | 20.7s / 20.7s | 609 / 632 | 39.3 / 39.4 | 40.4 / 40.5 |
+| throughput | 29.7s / 59.5s | 9,576 / 38,700 | 47.8 / 56.9 | 58.0 / 116.3 |
+| constant (low) | 22.0s / 22.0s | 617 / 617 | 41.9 / 41.9 | 43.0 / 43.0 |
+| constant (mid) | 24.0s / 24.1s | 614 / 646 | 45.8 / 45.9 | 46.9 / 47.1 |
+| constant (high) | 29.0s / 29.2s | 608 / 658 | 55.5 / 55.8 | 56.6 / 57.0 |
+
+**Throughput (All Requests)**
+
+| Strategy | Concurrency (Mdn) | Output tok/s (Mean) | Completed Reqs |
+|---|---|---|---|
+| synchronous | 1 | 25.1 | 2 |
+| throughput | 32 | 278.1 | 32 |
+| constant (low) | 1 | 23.9 | 1 |
+| constant (mid) | 2-3 | 36.0-49.4 | 2-3 |
+| constant (high) | 2 | 33.4-35.3 | 2 |
+
+#### Test 5: 1024 prompt / 512 output tokens
+
+**Latency (Completed Requests)**
+
+| Strategy | Req Latency (Mdn/p95) | TTFT Mdn/p95 (ms) | ITL Mdn/p95 (ms) | TPOT Mdn/p95 (ms) |
+|---|---|---|---|---|
+| synchronous | 20.7s / 20.9s | 611 / 632 | 39.3 / 39.8 | 40.5 / 40.9 |
+| throughput | 29.7s / 59.4s | 9,580 / 38,628 | 47.7 / 56.8 | 57.9 / 116.0 |
+| constant (low) | 22.1s / 22.1s | 620 / 620 | 42.0 / 42.0 | 43.2 / 43.2 |
+| constant (mid) | 24.6s / 24.7s | 665 / 677 | 46.8 / 46.9 | 48.1 / 48.2 |
+| constant (high) | 30.3s / 30.3s | 612 / 612 | 58.1 / 58.1 | 59.1 / 59.1 |
+
+**Throughput (All Requests)**
+
+| Strategy | Concurrency (Mdn) | Output tok/s (Mean) | Completed Reqs |
+|---|---|---|---|
+| synchronous | 1 | 25.0 | 2 |
+| throughput | 32 | 278.7 | 32 |
+| constant (low) | 1 | 23.8 | 1 |
+| constant (mid) | 3 | 49.4-49.5 | 3 |
+| constant (high) | 1-2 | 17.3-34.3 | 1-2 |
+
+#### Test 6: 2048 prompt / 1024 output tokens
+
+Test 6 is currently running. Results will be appended upon completion.
+
+---
+
+### Run 1: inf2.24xlarge (tp=8, 8 NeuronCores) — GuideLLM Sweep Results (Previous)
+
+Each test runs a 10-point sweep with max_model_len=8,192 tokens.
 
 #### Test 1: 128 prompt / 128 output tokens
 

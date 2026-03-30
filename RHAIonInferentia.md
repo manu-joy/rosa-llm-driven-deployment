@@ -160,6 +160,20 @@ I deployed and benchmarked a model on AWS Inferentia2 within a ROSA HCP (Red Hat
 | Throughput Variance | < 1% across 5 identical runs |
 | Model Memory Usage | ~2.1 GB / 32 GB HBM (7% utilization) |
 
+### Scaling Up: Qwen3-Coder-30B on inf2.48xlarge
+
+I also benchmarked a production-scale deployment: **Qwen3-Coder-30B-A3B-Instruct** (a 30.5B parameter Mixture-of-Experts model with 3.3B active parameters per token) on an `inf2.48xlarge` (12 Inferentia2 chips, 24 NeuronCores, 384 GB HBM). This was deployed using vLLM 0.13.0 with `tensor-parallel-size=16` and the NxD Inference framework for MoE expert parallelism.
+
+| Metric | inf2.48xlarge (Qwen3-Coder MoE) |
+|---|---|
+| **TTFT (single-user)** | 609–632 ms |
+| **ITL (single-user)** | 39.3 ms |
+| **Output throughput (single-user)** | 25 tokens/sec |
+| **Peak aggregate throughput** | 278 tokens/sec (32 concurrent) |
+| **Model compilation time** | ~45–60 minutes (first startup) |
+
+An important finding: **only 16 of 24 NeuronCores could be used** due to tensor parallelism divisibility constraints. The model's `hidden_size` (2048) must be evenly divisible by the TP degree, and 2048 ÷ 24 is not an integer. This means 33% of the hardware sits idle — a structural limitation for any model with power-of-2 hidden dimensions on 12- or 24-core Inferentia2 instances. Models with `hidden_size=6144` (like StarCoder2-15B) can use all 24 cores with zero waste. Full analysis and benchmark data are in the [detailed test results](inferentia_vllm_test_results.md).
+
 ### What Stood Out
 
 The consistency surprised me. I ran five identical test prompts back-to-back, and throughput variance was under 1%. If you've spent time on shared GPU environments where noisy-neighbor effects cause 20–40% latency spikes, you'll appreciate how unusual this is. Inferentia2 delivers remarkably deterministic performance.
@@ -613,7 +627,7 @@ Inferentia2 largely sidesteps these problems. Consistent availability in Singapo
 
 ### If You're a Platform Engineer or MLOps Practitioner
 
-The fastest way to get hands-on: read the [companion deployment guide](vllmoninferentia.md), which has the complete, validated step-by-step instructions with exact `oc` commands. Start with inf2.xlarge at $1.06/hr in Singapore — it's the most cost-effective accelerator with enough memory to run 8B models at full BF16. Benchmark your model against your current GPU baseline using the same test prompts, and scale up to inf2.24xlarge (12 NeuronCores, 192 GB HBM) or inf2.48xlarge (24 NeuronCores, 384 GB HBM) when you're ready for larger models.
+The fastest way to get hands-on: read the [companion deployment guide](vllmoninferentia.md), which has the complete, validated step-by-step instructions with exact `oc` commands, including both dense and MoE model deployment paths. Start with inf2.xlarge at $1.06/hr in Singapore — it's the most cost-effective accelerator with enough memory to run 8B models at full BF16. Benchmark your model against your current GPU baseline using the same test prompts, and scale up to inf2.24xlarge (12 NeuronCores, 192 GB HBM) or inf2.48xlarge (24 NeuronCores, 384 GB HBM) when you're ready for larger models. For detailed benchmark data including capacity planning and TCO analysis for 100-developer teams, see the [performance test results](inferentia_vllm_test_results.md).
 
 ### If You're an Enterprise Architect or Decision-Maker
 
@@ -630,6 +644,8 @@ For Red Hat AI deployment architecture, operator lifecycle management, and enter
 When I started this project, I expected Inferentia2 to be cheaper than GPU. I didn't expect it to be this straightforward to deploy, or this consistent in production. The sub-1% throughput variance across test runs isn't a number you see on shared GPU infrastructure. The operator-driven deployment isn't something you'd have gotten a year ago.
 
 What's changed is the ecosystem, not just the silicon. The AWS Neuron Operator on OpenShift, vLLM's native Neuron support, and the maturity of the Neuron SDK have collectively eliminated the integration pain that used to make Inferentia a hard sell for Kubernetes-native teams. The cost savings (25–50% per inference endpoint), consistent availability across 14+ AWS regions, and near-zero latency variance are real. I measured them.
+
+The MoE model results are particularly encouraging. A 30.5B-parameter Mixture-of-Experts coding model (Qwen3-Coder) served at 25 tokens/sec single-user with sub-40ms inter-token latency on a single inf2.48xlarge — enough for a team of developers using it as a coding assistant. The NeuronCore utilization constraint (33% waste on 12/24-core instances for most models) is a real cost consideration, but models with compatible dimensions like StarCoder2-15B can eliminate it entirely.
 
 That said, this isn't a "replace all your GPUs tomorrow" argument. Training and fine-tuning still belong on NVIDIA hardware for the foreseeable future, and some niche model architectures may not be optimized for Neuron yet. But for the workload that matters most at production scale — serving inference to real users — Inferentia2 is a serious option that deserves a spot in your evaluation.
 
@@ -660,6 +676,8 @@ Start with the [step-by-step deployment guide](vllmoninferentia.md) and see for 
 [10] HuggingFace — *"TinyLlama/TinyLlama-1.1B-Chat-v1.0"*. https://huggingface.co/TinyLlama/TinyLlama-1.1B-Chat-v1.0 — Model card for the TinyLlama model used in benchmarks.
 
 [11] vLLM Documentation — *"AWS Neuron Installation"*. https://docs.vllm.ai/en/latest/getting_started/installation/aws_neuron.html — vLLM installation and configuration guide for AWS Neuron.
+
+[12] Manu Joy — *"Qwen3-Coder-30B-A3B on AWS Inferentia2: Performance Benchmarking & Analysis"* (March 2026). [inferentia_vllm_test_results.md](inferentia_vllm_test_results.md) — GuideLLM benchmark results, NeuronCore utilization analysis, capacity planning, and TCO for coding model deployments on inf2.24xlarge and inf2.48xlarge.
 
 ---
 

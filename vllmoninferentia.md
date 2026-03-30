@@ -60,6 +60,8 @@ The components have strict dependency ordering:
 - **Model Storage Options**: For direct Deployments, use a **PVC on EBS** (ReadWriteOnce) so the Neuron compiler can write cached artifacts in-place. For **KServe**, use an **S3 bucket** with `storageUri` — KServe downloads model files to a writable `emptyDir`, and setting `NEURON_COMPILE_CACHE_URL` to a separate `emptyDir` keeps the Neuron cache writable. See Section 3 for detailed KServe approaches.
 - **Security Capabilities**: The Neuron runtime requires `IPC_LOCK` and `SYS_ADMIN` Linux capabilities. These must be granted in the container's `securityContext`.
 - **Container Image**: Use the AWS Neuron Deep Learning Container (DLC) from `public.ecr.aws/neuron/pytorch-inference-vllm-neuronx`. The image is large (~15–20 GB); first pull takes time. Use SDK 2.28.0+ for MoE model support.
+- **NeuronCore Utilization**: Not all NeuronCores on an instance may be usable. The `tp_degree` must evenly divide the model's `hidden_size` and `num_attention_heads`. Since most LLMs use power-of-2 dimensions (e.g., 2048, 4096), and `inf2.24xlarge` has 12 cores / `inf2.48xlarge` has 24 cores (neither a power of 2), the maximum usable TP degree is typically 8 or 16 respectively — leaving 33% of cores idle. Models with `hidden_size` divisible by 24 (e.g., 6144) can use all cores. See the [NeuronCore Utilization Analysis](inferentia_vllm_test_results.md#neuroncore-utilization-analysis).
+- **Neuron Scheduler + OVN Race Condition**: On ROSA HCP with OVN-Kubernetes CNI, the `neuron-scheduler` can cause a `FailedCreatePodSandBox: timed out waiting for annotations` error. This is a race condition where `neuron-scheduler`'s Bind callback overwrites OVN's network annotations. **Workaround**: After the pod is bound by `neuron-scheduler`, force-delete and restart the `ovnkube-node` pod on the Inferentia node (`oc delete pod -n openshift-ovn-kubernetes ovnkube-node-<hash> --force`). OVN will re-reconcile all pods on the node, correctly applying network annotations.
 
 ### MoE (Mixture-of-Experts) Model Notes
 
@@ -71,7 +73,7 @@ Deploying MoE models (e.g., Qwen3-Coder-30B-A3B, Qwen3-235B-A22B) on Inferentia2
 - **Chunked prefill is NOT supported**: Always pass `--no-enable-chunked-prefill` on Neuron.
 - **Prefix caching**: Disable with `--no-enable-prefix-caching` for MoE models.
 - **`--num-gpu-blocks-override`**: Required to avoid scheduler mismatch when chunked prefill and prefix caching are both disabled. Set to match `--max-num-seqs`.
-- **Expert parallelism**: The constraint `moe_tp_degree × moe_ep_degree = tp_degree` must hold. For `inf2.24xlarge` (12 NeuronCores), use `tp_degree=12, moe_tp_degree=1, moe_ep_degree=12`. For `inf2.48xlarge` (24 NeuronCores), use `tp_degree=24, moe_tp_degree=2, moe_ep_degree=12`.
+- **Expert parallelism**: The constraint `moe_tp_degree × moe_ep_degree = tp_degree` must hold. Additionally, `tp_degree` must evenly divide the model's `hidden_size` and `num_attention_heads`. For Qwen3-Coder-30B-A3B (`hidden_size=2048`, `num_attention_heads=16`), only power-of-2 TP degrees work: `tp_degree=8` on `inf2.24xlarge` (with `moe_tp_degree=1, moe_ep_degree=8`), or `tp_degree=16` on `inf2.48xlarge` (with `moe_tp_degree=2, moe_ep_degree=8`). Note: `tp_degree=24` is **not valid** for this model because 2048 is not divisible by 24 — see the [NeuronCore Utilization Analysis](inferentia_vllm_test_results.md#neuroncore-utilization-analysis) for details.
 - **Memory**: All expert weights must reside in HBM even though only a subset are active per token. A 30B-parameter MoE model requires ~61 GB in BF16 — `inf2.24xlarge` (192 GB HBM) is the minimum viable instance.
 - **Neuron scheduler**: Use `schedulerName: neuron-scheduler` in the pod spec for topology-aware placement across NeuronCores.
 - **Shared memory**: Mount `/dev/shm` as an emptyDir with `medium: Memory` for inter-process communication during MoE inference.
@@ -616,7 +618,7 @@ data:
 EOF
 ```
 
-> **Adjusting for `inf2.48xlarge`** (24 NeuronCores): Set `tp_degree: 24`, `moe_tp_degree: 2`, `moe_ep_degree: 12`, `attention_dp_degree: 2`, and increase `max_context_length`/`seq_len` to `32768`. Add `strided_context_parallel_kernel_enabled: true`.
+> **Adjusting for `inf2.48xlarge`** (24 NeuronCores): Due to tensor parallelism divisibility constraints (see NeuronCore Utilization notes above), most models with power-of-2 `hidden_size` (e.g., 2048, 4096) can only use 16 of 24 cores. Set `tp_degree: 16`, `moe_tp_degree: 2`, `moe_ep_degree: 8`, `NEURON_RT_VISIBLE_CORES: "0-15"`, and request `aws.amazon.com/neuroncore: "16"`. Increase `max_context_length`/`seq_len` to `16384` or `32768`. For models with `hidden_size` divisible by 24 (e.g., StarCoder2-15B with `hidden_size=6144`), you can use all 24 cores: set `tp_degree: 24`.
 
 **Step 2: Create the MoE Deployment**
 
@@ -898,6 +900,9 @@ Model Storage (Steps 6-7: PVC + download job)
 | `huggingface-cli: command not found` in download job | CLI not on PATH in minimal Python image | Use `python -m huggingface_hub.commands.hf_cli` instead |
 | Pod stuck in Pending with `neuroncore` resource error | Neuron device plugin not running or DeviceConfig not applied | Verify DeviceConfig exists and device-plugin pod is running |
 | First startup takes 30+ minutes | Normal — Neuron ahead-of-time compilation | Wait for compilation to finish; check logs for progress |
+| `FailedCreatePodSandBox: timed out waiting for annotations` | Race condition between `neuron-scheduler` Bind and OVN-Kubernetes network annotation | Force-delete and restart the `ovnkube-node` pod on the Inferentia node after the neuron-scheduler binds the pod. OVN will re-reconcile and apply correct annotations. |
+| `UnexpectedAdmissionError: requested Neuron resources are invalid without k8s-neuron-scheduler` | Pod uses `schedulerName: default-scheduler` but requests `aws.amazon.com/neuroncore` | The Neuron device plugin enforces use of `neuron-scheduler`. Set `schedulerName: neuron-scheduler` in pod spec. |
+| Only 8 of 12 (or 16 of 24) NeuronCores used | `tp_degree` must divide model's `hidden_size` and `num_attention_heads`; 12 and 24 are not powers of 2 | This is a fundamental constraint. Use `tp_degree=8` on inf2.24xlarge or `tp_degree=16` on inf2.48xlarge for models with power-of-2 hidden dimensions. See [NeuronCore Utilization Analysis](inferentia_vllm_test_results.md#neuroncore-utilization-analysis). |
 
 ## Section 3: Serving Models with KServe on Inferentia2
 
@@ -1744,7 +1749,19 @@ This template would need testing with the KServe `InferenceService` workflow to 
 
 ---
 
-## Appendix E: References
+## Appendix E: Performance Benchmark Results
+
+For detailed GuideLLM benchmark results, capacity planning, and TCO analysis for Qwen3-Coder-30B-A3B-Instruct on `inf2.24xlarge` and `inf2.48xlarge`, see the [Inferentia vLLM Test Results](inferentia_vllm_test_results.md). Key findings include:
+
+- **Single-user performance**: ~24-25 output tokens/sec with 609-632ms TTFT and 39ms ITL on inf2.48xlarge (tp=16)
+- **Throughput scaling**: ~278 output tok/s aggregate at max concurrency (32 concurrent)
+- **NeuronCore utilization**: 16 of 24 cores usable (33% waste) due to TP divisibility constraints — see [NeuronCore Utilization Analysis](inferentia_vllm_test_results.md#neuroncore-utilization-analysis)
+- **Container & model weight architecture**: 19 GB runtime container + 57 GB model weights decoupled via EBS PVC, with S3 recommended for production
+- **TCO for 100 developers**: $209/dev/month (3-year reserved) with 4× inf2.24xlarge
+
+---
+
+## Appendix F: References
 
 - [Run cost-effective AI workloads on OpenShift with AWS Neuron Operator](https://developers.redhat.com/articles/2025/12/02/cost-effective-ai-workloads-openshift-aws-neuron-operator)
 - [AWS Neuron Documentation](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/)
