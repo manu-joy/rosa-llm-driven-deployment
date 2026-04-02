@@ -27,7 +27,7 @@ RUN code-server --install-extension saoudrizwan.claude-dev \
 COPY --chown=1000:1000 settings.json /home/coder/.local/share/code-server/User/settings.json
 COPY --chown=1000:1000 continue-config.json /home/coder/.continue/config.json
 
-ENV VLLM_ENDPOINT="https://vllm-neuron-llm-serving.apps.rosa.CLUSTER_DOMAIN"
-ENV MODEL_NAME="Qwen3-Coder-30B-A3B-Instruct"
+ENV VLLM_ENDPOINT="https://vllm-dual-pvc-test-llm-serving.apps.rosa.CLUSTER_DOMAIN"
+ENV MODEL_NAME="qwen3-coder"
 
 EXPOSE 8080

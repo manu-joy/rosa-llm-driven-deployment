@@ -24,6 +24,9 @@ terraform.tfvars
 *.swo
 *~
 
+# Test plans (local only)
+testplans/
+
 # Temporary files
 *.tmp
 *.log
