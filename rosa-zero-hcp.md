@@ -59,12 +59,12 @@ cluster creation and management |
 │  │                 AWS Services                       │                               │
 │  │                                                    │                               │
 │  │  ┌──────────────────────────────────────────────┐  │                               │
-│  │  │ ECR (Red Hat Managed: 539247463739)           │  │                               │
+│  │  │ ECR (Red Hat Managed: <REDHAT_ECR_ACCOUNT_ID>)           │  │                               │
 │  │  │ ► OCP platform images (quay.io mirrors)       │  │                               │
 │  │  │ ► Red Hat operator images                     │  │                               │
 │  │  └──────────────────────────────────────────────┘  │                               │
 │  │  ┌──────────────────────────────────────────────┐  │                               │
-│  │  │ ECR (Customer: 905413050400)                  │  │                               │
+│  │  │ ECR (Customer: <AWS_ACCOUNT_ID>)                  │  │                               │
 │  │  │ ► openshift-mirror/nvidia/* (GPU Operator)    │  │                               │
 │  │  │ ► openshift-mirror/redhat/certified-op-index  │  │                               │
 │  │  └──────────────────────────────────────────────┘  │                               │
@@ -92,8 +92,8 @@ External (Internet-Connected) ─── used only during setup ───
 ```
 
 **Image flow:**
-- Red Hat platform images: `quay.io` / `registry.redhat.io` → Red Hat ECR (`539247463739`) → Worker nodes (via ECR VPC endpoints)
-- Third-party operators (NVIDIA): `nvcr.io` → Customer ECR (`905413050400`) → Worker nodes (via ECR VPC endpoints)
+- Red Hat platform images: `quay.io` / `registry.redhat.io` → Red Hat ECR (`<REDHAT_ECR_ACCOUNT_ID>`) → Worker nodes (via ECR VPC endpoints)
+- Third-party operators (NVIDIA): `nvcr.io` → Customer ECR (`<AWS_ACCOUNT_ID>`) → Worker nodes (via ECR VPC endpoints)
 - S3 staging: CLI binaries, mirror archives, manifests transferred via S3 Gateway endpoint
 
 ---
@@ -546,12 +546,12 @@ terraform destroy -var region=$REGION \
 
 | Resource | ID/Value |
 |----------|----------|
-| Instance ID | `i-094f82aa26d5258f6` |
+| Instance ID | `<BASTION_INSTANCE_ID>` |
 | Instance Type | `t3.medium` |
 | OS | Windows Server 2022 Datacenter |
 | Private IP | `10.0.0.120` |
-| Subnet | `subnet-030028fd13cb6e4e6` (ap-southeast-1a) |
-| Security Group | `sg-0797dbe337d56bc76` |
+| Subnet | `<BASTION_SUBNET_ID>` (ap-southeast-1a) |
+| Security Group | `<BASTION_SG_ID>` |
 | IAM Role | `rosazeroeg-bastion-ssm-role` |
 | Instance Profile | `rosazeroeg-bastion-profile` |
 
@@ -559,9 +559,9 @@ terraform destroy -var region=$REGION \
 
 | Endpoint | ID | Service |
 |----------|----|---------|
-| SSM | `vpce-022e3e9b7c55b0c32` | `com.amazonaws.ap-southeast-1.ssm` |
-| SSM Messages | `vpce-0fbb4c3b84df1b2c7` | `com.amazonaws.ap-southeast-1.ssmmessages` |
-| EC2 Messages | `vpce-00034f24895209582` | `com.amazonaws.ap-southeast-1.ec2messages` |
+| SSM | `<SSM_VPCE_ID>` | `com.amazonaws.ap-southeast-1.ssm` |
+| SSM Messages | `<SSM_MSG_VPCE_ID>` | `com.amazonaws.ap-southeast-1.ssmmessages` |
+| EC2 Messages | `<EC2_MSG_VPCE_ID>` | `com.amazonaws.ap-southeast-1.ec2messages` |
 
 ### How to Access the Jump Host via Session Manager
 
@@ -569,7 +569,7 @@ terraform destroy -var region=$REGION \
 
 1. Go to **AWS Systems Manager** > **Session Manager** in the `ap-southeast-1` region
 2. Click **Start session**
-3. Select instance `i-094f82aa26d5258f6` (`rosazeroeg-windows-bastion`)
+3. Select instance `<BASTION_INSTANCE_ID>` (`rosazeroeg-windows-bastion`)
 4. Click **Start session** — opens a PowerShell terminal in your browser
 
 #### Option 2: AWS CLI
@@ -581,12 +581,12 @@ terraform destroy -var region=$REGION \
 
 # Start a session
 aws ssm start-session \
-  --target i-094f82aa26d5258f6 \
+  --target <BASTION_INSTANCE_ID> \
   --region ap-southeast-1
 
 # Start a port-forwarding session (e.g., to use RDP)
 aws ssm start-session \
-  --target i-094f82aa26d5258f6 \
+  --target <BASTION_INSTANCE_ID> \
   --document-name AWS-StartPortForwardingSession \
   --parameters '{"portNumber":["3389"],"localPortNumber":["33389"]}' \
   --region ap-southeast-1
@@ -597,7 +597,7 @@ aws ssm start-session \
 
 ```bash
 aws ssm send-command \
-  --instance-ids i-094f82aa26d5258f6 \
+  --instance-ids <BASTION_INSTANCE_ID> \
   --document-name "AWS-RunPowerShellScript" \
   --parameters 'commands=["oc get nodes","oc get clusterversion"]' \
   --region ap-southeast-1 \
@@ -606,7 +606,7 @@ aws ssm send-command \
 # Retrieve output
 aws ssm get-command-invocation \
   --command-id <COMMAND_ID> \
-  --instance-id i-094f82aa26d5258f6 \
+  --instance-id <BASTION_INSTANCE_ID> \
   --query '[Status,StandardOutputContent]' --output text
 ```
 
@@ -620,7 +620,7 @@ aws ssm get-command-invocation \
 
 ### S3 Staging Bucket
 
-CLI binaries were staged via `s3://rosazeroeg-staging-905413050400/cli/` since the bastion has no internet access. The bastion downloads from S3 using the S3 Gateway VPC endpoint.
+CLI binaries were staged via `s3://rosazeroeg-staging-<AWS_ACCOUNT_ID>/cli/` since the bastion has no internet access. The bastion downloads from S3 using the S3 Gateway VPC endpoint.
 
 ---
 
@@ -630,25 +630,25 @@ CLI binaries were staged via `s3://rosazeroeg-staging-905413050400/cli/` since t
 
 | Step | Planned | Actual | Notes |
 |------|---------|--------|-------|
-| VPC creation | Terraform zero-egress template | **AWS CLI** (Terraform not installed) | VPC `vpc-00aa3ede1510867ff` created |
+| VPC creation | Terraform zero-egress template | **AWS CLI** (Terraform not installed) | VPC `<VPC_ID>` created |
 | VPC endpoints verified | 4 endpoints (STS, ECR API, ECR DKR, S3) | **4 endpoints created** | All in `available` state |
 | No IGW/NAT verified | No IGW, no NAT, no public subnets | **Verified** | `describe-internet-gateways` and `describe-nat-gateways` return empty |
 | Account roles | `rosa create account-roles --hosted-cp` | **Created** | ECR ReadOnly auto-attached to Worker Role |
 | OIDC config | `rosa create oidc-config` | **Created** | ID: `2p38fhrmfs7s9h5fib2pq419mldtkarq` |
 | Operator roles | `rosa create operator-roles --hosted-cp` | **Created** | 8 roles, prefix `rosazeroeg` |
 | OCM + User roles | Needed for billing | **Created** | Required for billing account linkage |
-| Cluster creation | `--properties zero_egress:true` | **Created** at 04:23 UTC | Billing account `997105976459` (cross-account) |
+| Cluster creation | `--properties zero_egress:true` | **Created** at 04:23 UTC | Billing account `<BILLING_ACCOUNT_ID>` (cross-account) |
 | Cluster ready | 15-30 min expected | **~8 min** to `ready` state | Faster than expected |
 | Worker nodes | 3 nodes | **3 nodes Ready** across 3 AZs | `10.0.0.31`, `10.0.1.81`, `10.0.2.186` |
 | Cluster admin | `rosa create admin` | **Created** | user: `cluster-admin` |
-| Windows bastion | SSM access | **Working** | Instance `i-094f82aa26d5258f6`, SSM Online |
-| AWS CLI login | Bastion | **Confirmed** | `sts get-caller-identity` returns `905413050400` |
+| Windows bastion | SSM access | **Working** | Instance `<BASTION_INSTANCE_ID>`, SSM Online |
+| AWS CLI login | Bastion | **Confirmed** | `sts get-caller-identity` returns `<AWS_ACCOUNT_ID>` |
 | ROSA login | Bastion | **Failed (expected)** | Requires internet for `sso.redhat.com` |
 | OC login | Bastion | **Confirmed** | `oc whoami` returns `cluster-admin` |
 
 ### Key Observations
 
-1. **Billing account cross-linking works**: Used billing account `997105976459` from a different AWS account — the Red Hat organization links them
+1. **Billing account cross-linking works**: Used billing account `<BILLING_ACCOUNT_ID>` from a different AWS account — the Red Hat organization links them
 2. **Cluster install was fast**: ~8 minutes from `waiting` to `ready`, faster than standard HCP
 3. **ROSA CLI auto-detected ECR policy**: When creating account roles with `--hosted-cp`, the CLI automatically attached `AmazonEC2ContainerRegistryReadOnly` to the Worker Role
 4. **SSM endpoints are essential**: Without SSM VPC endpoints (`ssm`, `ssmmessages`, `ec2messages`), the SSM agent cannot register and the bastion is unreachable
@@ -664,16 +664,16 @@ CLI binaries were staged via `s3://rosazeroeg-staging-905413050400/cli/` since t
 | Cluster ID | `2p38idgsae168pmg260fobnch7vvc288` |
 | OpenShift Version | 4.18.34 |
 | Region | ap-southeast-1 |
-| DNS | `rosazeroeg.0xld.p3.openshiftapps.com` |
-| API URL | `https://api.rosazeroeg.0xld.p3.openshiftapps.com:443` |
+| DNS | `rosazeroeg.<CLUSTER_HASH>.openshiftapps.com` |
+| API URL | `https://api.rosazeroeg.<CLUSTER_HASH>.openshiftapps.com:443` |
 | Private | Yes |
 | Zero Egress | Enabled |
 | Workers | 3 x m5.xlarge (one per AZ) |
 | Network | OVNKubernetes |
 | Machine CIDR | 10.0.0.0/16 |
-| VPC ID | `vpc-00aa3ede1510867ff` |
-| AWS Account | 905413050400 |
-| Billing Account | 997105976459 |
+| VPC ID | `<VPC_ID>` |
+| AWS Account | <AWS_ACCOUNT_ID> |
+| Billing Account | <BILLING_ACCOUNT_ID> |
 
 ---
 
@@ -683,7 +683,7 @@ CLI binaries were staged via `s3://rosazeroeg-staging-905413050400/cli/` since t
 
 ### The Problem
 
-Red Hat mirrors its own Operators (from `redhat-operator-index`) to a managed ECR account (`539247463739`) for zero-egress clusters. However, **third-party operators** from the `certified-operator-index` or `community-operator-index` — such as the **NVIDIA GPU Operator** — are **not mirrored**. These operators and their operand images must be manually mirrored to a customer-owned ECR in the same region.
+Red Hat mirrors its own Operators (from `redhat-operator-index`) to a managed ECR account (`<REDHAT_ECR_ACCOUNT_ID>`) for zero-egress clusters. However, **third-party operators** from the `certified-operator-index` or `community-operator-index` — such as the **NVIDIA GPU Operator** — are **not mirrored**. These operators and their operand images must be manually mirrored to a customer-owned ECR in the same region.
 
 ### ROSA HCP and ImageDigestMirrorSet (IDMS)
 
@@ -731,7 +731,7 @@ The correct approach uses `rosa create image-mirror` which injects entries into 
                  ▼
     ┌────────────────────────┐
     │  Customer ECR          │
-    │  905413050400.dkr.ecr  │
+    │  <AWS_ACCOUNT_ID>.dkr.ecr  │
     │  .ap-southeast-1       │
     │  .amazonaws.com/       │
     │  openshift-mirror/*    │ ◄── 14 repositories, 16 images

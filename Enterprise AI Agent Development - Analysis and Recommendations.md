@@ -989,58 +989,8 @@ Why: Vendor-neutral, cost-effective, production-ready,
 
 ---
 
----
-
-## AI Code Assistants with OpenShift Dev Spaces -- Architecture Patterns
-
-*Reference diagrams from Red Hat Dev Spaces engineering (Dev Spaces 3.27+)*
-
-### Two Deployment Patterns for AI-Assisted Development
-
-Red Hat Dev Spaces supports two distinct architectural patterns for integrating AI code assistants into enterprise development environments. Both patterns ensure that all compute, runtimes, code, and extensions run server-side within the OpenShift cluster, while differing in how the developer's IDE connects.
-
-#### Pattern 1: Web IDE (Browser-Based)
-
-In this pattern, the developer accesses the Dev Spaces Dashboard through a browser, which provisions a Cloud Development Environment (CDE) containing a web-based IDE (che-code / VS Code for the Web), AI assistant extensions, runtimes, source code, and plugins -- all running inside OpenShift.
-
-Compatible AI assistants in this mode include web-native and CLI-based tools: Kilo, Roo, Codex, Claude Code CLI, GitHub Copilot CLI, and similar OSS assistants. A key architectural note is that most open-source assistants (such as Roo) are fully client-side, meaning their API calls go directly from the workspace container to the LLM provider, bypassing any third-party relay servers.
-
-The LLM routing decision follows a simple branch: Red Hat AI (or the platform administrator) determines whether the request should go to an on-premises model (e.g., a self-hosted vLLM instance on Inferentia or NVIDIA GPUs, as deployed in this project) or to an external cloud model provider (AWS Bedrock, OpenAI, etc.). This is precisely the architecture we have implemented with Continue and Cline extensions pointing at our llm-d gateway endpoint.
-
-#### Pattern 2: Remote SSH (Thin Client Desktop IDE)
-
-This pattern is designed for developers who prefer native desktop IDEs -- specifically Cursor, GitHub Copilot (in VS Code), and Kiro. The local desktop IDE acts as a thin UI shell only; all IDE backend processing, extension execution, compute, and code remain server-side within the Dev Spaces workspace on OpenShift.
-
-The connection uses SSH over HTTPS through the OpenShift API server, which provides the same RBAC and TLS protections as any other cluster API call. This approach unlocks access to official VS Code Marketplace extensions (e.g., GitHub Copilot, C# Dev Kit) that may not be available in the open-source che-code web IDE. The desktop IDE can also connect to third-party servers (such as Cursor Server) for additional AI capabilities.
-
-### Remote SSH Technical Flow and Security (Dev Spaces 3.27+)
-
-The Remote SSH capability, released in Dev Spaces 3.27, provides a secure tunnel between the developer's local IDE and their workspace container:
-
-1. **Authentication**: The Dev Spaces SSH extension runs `oc login --web` to authenticate the developer via the cluster's Identity Provider (IDP). This is the primary security gate -- it requires the developer to authenticate through the same OpenShift IDP (e.g., HTPasswd, LDAP, OIDC) used for all cluster access.
-
-2. **Port Forwarding**: The extension runs `oc port-forward -n ${namespace} ${workspace-pod} ${local-port}:2022`, establishing an encrypted tunnel through the Kubernetes API server. This connection is encrypted via TLS and protected by RBAC -- no separate network path or ingress route is needed.
-
-3. **Ephemeral SSH Keys**: The extension generates a fresh SSH key pair for each workspace session. These keys are ephemeral and rotate on every workspace restart, eliminating the risk of key compromise from long-lived credentials.
-
-**Security properties:**
-- The SSHD service inside the workspace container listens on port 2022 but is never exposed via an OpenShift Route or Ingress. It is only reachable through the authenticated API tunnel.
-- All traffic flows through the Kubernetes API server, inheriting its TLS encryption and RBAC authorization.
-- Supported SSH algorithms align with UBI 10 cryptographic standards (FIPS-compatible).
-
-### Relevance to This Project
-
-This architecture directly validates and extends our current deployment:
-
-- **Pattern 1** is what we have deployed today: Dev Spaces 3.27 with Continue and Cline extensions in the web IDE, connecting to our self-hosted LLM via the llm-d gateway.
-- **Pattern 2** provides a future upgrade path for developers who prefer Cursor or native VS Code, while keeping all compute and code on-cluster. The SSH tunnel security model aligns with enterprise requirements (no direct network exposure, ephemeral credentials, RBAC-gated access).
-- The on-prem model routing path shown in the diagram maps exactly to our llm-d + vLLM architecture: Dev Spaces workspace -> llm-d gateway -> EPP (load-aware + prefix-cache routing) -> vLLM replicas on GPU/Inferentia nodes.
-- The ability to simultaneously support web IDE users (Pattern 1) and Remote SSH users (Pattern 2) against the same llm-d inference pool makes this a flexible platform for hundreds of developers with varying IDE preferences.
-
----
-
-**Document Version**: 1.1  
-**Last Updated**: March 2026  
+**Document Version**: 1.0  
+**Last Updated**: December 2024  
 **Research Quality**: Enterprise Decision Framework  
 **Status**: Production-Ready Recommendations
 

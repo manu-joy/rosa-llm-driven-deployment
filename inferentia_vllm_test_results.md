@@ -3,6 +3,8 @@
 ## Table of Contents
 - [Deployment Configuration](#deployment-configuration)
 - [Dense Model Comparative Benchmarks (Run 3)](#dense-model-comparative-benchmarks-run-3)
+- [Container & Model Weight Architecture](#container--model-weight-architecture)
+- [Storage Options Comparison: EBS vs EFS vs S3](#storage-options-comparison-ebs-vs-efs-vs-s3)
 - [NeuronCore Utilization Analysis](#neuroncore-utilization-analysis)
 - [Benchmarking Methodology](#benchmarking-methodology)
 - [Key Performance Metrics Explained](#key-performance-metrics-explained)
@@ -35,6 +37,8 @@
 | **Max Concurrent Seqs** | 16 (batch_size=16) |
 | **Neuron Cores Used** | 16 of 24 (NEURON_RT_VISIBLE_CORES=0-15) |
 | **Scheduler** | neuron-scheduler (topology-aware contiguous core allocation) |
+| **Storage** | EBS gp3 PVC, 500 Gi (model weights + NEFF cache on same volume) |
+| **NEFF Cache Location** | `/mnt/models/neuron-cache` on PVC (persistent across restarts) |
 | **Endpoint** | OpenAI-compatible API (vLLM `/v1/completions`, `/v1/chat/completions`) |
 
 ### Run 1: inf2.24xlarge (Previous)
@@ -52,6 +56,8 @@
 | **Max Model Length** | 8,192 tokens |
 | **Max Concurrent Seqs** | 16 (batch_size=16) |
 | **Neuron Cores Used** | 8 of 12 (NEURON_RT_VISIBLE_CORES=0-7) |
+| **Storage** | EBS gp3 PVC, 500 Gi (model weights + NEFF cache on same volume) |
+| **NEFF Cache Location** | `/mnt/models/neuron-cache` on PVC (persistent across restarts) |
 | **Endpoint** | OpenAI-compatible API (vLLM `/v1/completions`, `/v1/chat/completions`) |
 
 ### Run 3: Dense Model Comparison on inf2.24xlarge
@@ -72,6 +78,8 @@ Two dense coding models were tested in parallel on separate inf2.24xlarge nodes:
 | **Max Concurrent Seqs** | 4 |
 | **BF16 Weight Size** | ~64 GB |
 | **Neuron Cores Used** | 8 of 12 (NEURON_RT_VISIBLE_CORES=0-7) |
+| **Storage** | EBS gp3 PVC, 200 Gi (model weights + NEFF cache on same volume) |
+| **NEFF Cache Location** | `/models/neuron-cache` on PVC (persistent across restarts) |
 
 **Node B — CodeLlama-34B-Instruct**
 
@@ -87,6 +95,8 @@ Two dense coding models were tested in parallel on separate inf2.24xlarge nodes:
 | **Max Concurrent Seqs** | 4 |
 | **BF16 Weight Size** | ~68 GB |
 | **Neuron Cores Used** | 8 of 12 (NEURON_RT_VISIBLE_CORES=0-7) |
+| **Storage** | EBS gp3 PVC, 200 Gi (model weights + NEFF cache on same volume) |
+| **NEFF Cache Location** | `/models/neuron-cache` on PVC (persistent across restarts) |
 
 ---
 
@@ -176,43 +186,181 @@ Both models required disabling NKI kernel optimizations (`qkv_kernel_enabled: fa
 
 ### Component Sizes
 
-| Component | Size | Storage Type | Cost |
+| Component | Size | Storage Type | Notes |
 |---|---|---|---|
-| **vLLM Runtime Container** | 19.0 GB | ECR → CRI-O image cache on node | Pull time: ~2 min |
-| **Qwen3-Coder-30B-A3B weights** | 57 GB | EBS PVC (gp3, 500 GB RWO) | $0.08/GB/month |
-| **Qwen2.5-Coder-32B weights** | 62 GB | EBS PVC (same volume) | Included above |
-| **Neuron compilation cache** | ~20-40 GB/model | EBS PVC (same volume) | Included above |
-| **Total EBS footprint** | ~200 GB used / 500 GB provisioned | EBS gp3 | $40/month |
+| **vLLM Runtime Container** | 19.0 GB | ECR → CRI-O image cache on node | Pull time: ~2 min on first schedule |
+| **Qwen3-Coder-30B-A3B weights** (MoE) | 57 GB | EBS PVC (gp3, RWO) | BF16, 30.5B total params |
+| **Qwen3-32B weights** (Dense) | 64 GB | EBS PVC (gp3, RWO) | BF16, 32.8B params |
+| **CodeLlama-34B-Instruct weights** (Dense) | 68 GB | EBS PVC (gp3, RWO) | BF16, 33.7B params |
+| **Neuron compilation cache (NEFF)** | 20–40 GB per model | EBS PVC (same volume) | Specific to model + tp_degree + max_model_len + SDK version |
+| **Typical per-node EBS footprint** | ~100–120 GB used / 200 GB provisioned | EBS gp3 | One model + one NEFF cache per node |
 
 ### Model Weight Decoupling
 
-Model weights are **decoupled from the container image**. The 19 GB runtime image contains only the vLLM engine, PyTorch, and Neuron SDK. Model files are loaded at startup from a PersistentVolumeClaim mounted at `/mnt/models`.
+Model weights are **decoupled from the container image**. The 19 GB runtime image contains only the vLLM engine, PyTorch, and Neuron SDK. Model files are loaded at startup from a PersistentVolumeClaim mounted at `/mnt/models` (or `/models`). This decoupling means:
 
-### Current Limitations (EBS-based PVC)
+- The container image is model-agnostic and reusable across all supported models.
+- Model weights can be updated, swapped, or versioned independently of the serving runtime.
+- The Neuron compilation cache (`NEURON_COMPILE_CACHE_URL`) is stored on the same or a separate writable volume, enabling warm restarts without recompilation.
 
-| Issue | Impact |
-|---|---|
-| **ReadWriteOnce** | Only one pod on one node can mount the volume simultaneously |
-| **Scaling penalty** | Adding a second inf2 node requires a new PVC + model re-download (~10 min for 57 GB) |
-| **Cold start** | Node replacement → EBS detach/attach + model recompilation = 30-60 min |
-| **Over-provisioned** | Paying for 500 GB even though only ~200 GB is used |
+---
 
-### Recommended: S3 for Model Weights (Production Architecture)
+## Storage Options Comparison: EBS vs EFS vs S3
 
-For production deployments, model weights should be stored in Amazon S3 and accessed via either:
-1. **Mountpoint for Amazon S3 CSI driver** — mounts S3 bucket as a POSIX filesystem
-2. **Init container with `aws s3 sync`** — downloads weights from S3 to a local emptyDir at pod startup
+### Why Storage Choice Matters for Inferentia2
 
-| Metric | EBS gp3 (Current) | S3 (Recommended) |
+Unlike GPU-based inference where models load directly from disk into GPU memory, Inferentia2 requires a **Neuron compilation step** on first startup. The compiler reads model weights, generates HLO intermediate representations, compiles them into NEFF binaries, and writes the compiled artifacts to a cache directory. This process has specific storage requirements:
+
+1. **Model weights** must be readable at startup (~57–68 GB for 30B+ models).
+2. **NEFF cache** must be writable during compilation (~20–40 GB per model configuration).
+3. **Subsequent restarts** with the same config skip compilation if the NEFF cache is available (cold start drops from 20–55 min to 2–5 min).
+
+### Observed Data from Testing
+
+| Metric | Observed Value | Source |
 |---|---|---|
-| **Storage cost** | $0.08/GB/month ($40/mo for 500 GB) | $0.023/GB/month ($4.60/mo for 200 GB) |
-| **Multi-node access** | No (RWO) | Yes (ReadWriteMany) |
-| **Scale-out penalty** | 10+ min (new PVC + download) | 0 (shared bucket, or parallel S3 sync) |
-| **Pre-allocation** | Required (500 GB upfront) | None (pay for what you store) |
-| **Read throughput** | 1 GB/s (gp3 max) | 100+ Gbps (S3 multi-part) |
-| **Write support** | Full POSIX | Append-only (Mountpoint) or S3 API |
+| Qwen3-32B NEFF compilation time | ~6 min (after 8s HLO generation) | Run 3, inf2.24xlarge |
+| CodeLlama-34B NEFF compilation time | ~12 min (after 45s HLO generation) | Run 3, inf2.24xlarge |
+| Qwen3-Coder-30B-A3B compilation time | ~15–20 min | Run 1/2, inf2.24xlarge/48xlarge |
+| Model download time (HuggingFace → PVC) | ~8–12 min for 57–68 GB | All runs |
+| Warm restart (cached NEFFs on EBS) | ~2–5 min | All runs |
+| S3 download overhead (KServe init container) | ~60–90 sec for 8 GB model | Appendix D, Lesson #5 |
+| S3 download estimate for 64 GB model | ~5–8 min (same-region, multi-part) | Extrapolated |
 
-**Compilation cache** should remain on EBS (small, write-heavy, per-node) or be pre-compiled and stored in S3 for instant startup.
+### Three-Way Comparison
+
+| Dimension | EBS gp3 (PVC, RWO) | EFS Standard (PVC, RWX) | S3 Standard |
+|---|---|---|---|
+| **Cost per 100 GB/month** | **$8.00** | $30.00 (3.75× EBS) | **$2.30** (cheapest) |
+| **Access mode** | ReadWriteOnce | **ReadWriteMany** | **ReadWriteMany** (via Mountpoint CSI or init container) |
+| **Sequential read throughput** | 125 MiB/s baseline (provisionable to 1,000 MiB/s) | Elastic: scales with load; ~100–500 MiB/s typical | **100+ Gbps** with multi-part parallel reads |
+| **Write support** | **Full POSIX** (random + sequential) | **Full POSIX** (random + sequential) | No random writes; append-only via Mountpoint; S3 API only |
+| **Read latency (first byte)** | **<1 ms** (block device) | 1–5 ms (NFS over network) | 5–20 ms (HTTP GET, first byte) |
+| **Neuron NEFF cache writable?** | **Yes** — ideal for compilation | **Yes** — works but higher latency during write-heavy compilation | **No** — Mountpoint is append-only; cannot write NEFF cache directly |
+| **Multi-node model sharing** | No — one pod per volume | **Yes** — multiple pods across nodes | **Yes** — any number of pods |
+| **Cold start (no NEFF cache)** | Model already on disk → compile only (6–20 min) | Model already on PVC → compile only (6–20 min, slightly slower I/O) | Download model (5–8 min) + compile (6–20 min) = **11–28 min** |
+| **Warm restart (NEFF cached)** | **2–5 min** (fastest — model + cache on local block device) | 3–7 min (model on NFS, cache on emptyDir) | Download model (5–8 min) + load cache (2–3 min) = **7–11 min** |
+| **Pre-allocation required?** | Yes — provision volume size upfront | No — pay for stored bytes only | No — pay for stored bytes only |
+| **Operational complexity** | **Low** — standard Kubernetes PVC | Medium — EFS filesystem + mount targets + CSI driver setup | Medium — S3 bucket + IAM/IRSA + Mountpoint CSI or init container |
+| **KServe compatibility** | Limited — KServe mounts PVCs read-only | Works with `storageUri: pvc://` (read-only mount OK if NEFF cache on emptyDir) | **Best** — KServe natively supports `storageUri: s3://` |
+| **Disaster recovery** | Snapshots (manual or automated) | Cross-AZ replication built-in | **11 nines durability**, versioning, cross-region replication |
+
+### Cost Scenario: Production with 4 Models on 4 Nodes
+
+Assumes 4 dense models (~65 GB average weights), each with a ~30 GB NEFF cache, on 4 `inf2.24xlarge` nodes.
+
+| Storage Strategy | Model Weights | NEFF Cache | Total Stored | Monthly Cost |
+|---|---|---|---|---|
+| **EBS only** (one 200 GB PVC per node) | 4 × 65 GB = 260 GB on EBS | 4 × 30 GB = 120 GB on EBS | 4 × 200 GB = 800 GB EBS | **$64.00** |
+| **EFS only** (shared RWX PVC) | 260 GB on EFS | 120 GB on emptyDir (lost on restart) | 260 GB EFS | **$78.00** + recompilation on every restart |
+| **S3 only** (KServe with storageUri) | 260 GB on S3 | 120 GB on emptyDir (lost on restart) | 260 GB S3 | **$5.98** + re-download + recompilation on every restart |
+| **Hybrid: S3 + EBS** (recommended) | 260 GB on S3 (source of truth) + local emptyDir | 4 × 30 GB = 120 GB on EBS (persistent per node) | 260 GB S3 + 120 GB EBS | **$15.58** ($5.98 S3 + $9.60 EBS) |
+| **Hybrid: S3 + EBS (pre-compiled)** | 260 GB on S3 | 120 GB on S3 (pre-compiled NEFF) + EBS local copy | 380 GB S3 + 120 GB EBS | **$18.34** ($8.74 S3 + $9.60 EBS) — fastest startup |
+
+### Storage Cost vs Project Cost: Why Performance Wins
+
+Before choosing a storage strategy, it is critical to compare storage cost against total project cost:
+
+| Deployment (3yr reserved) | Monthly Project Cost | EBS Only (best perf.) | Hybrid S3+EBS | EFS Only | Storage as % of Project |
+|---|---|---|---|---|---|
+| **Single inf2.24xlarge** | $6,186/mo | $16/mo | $16/mo | $30/mo | **0.16–0.48%** |
+| **Option A: 4× inf2.24xlarge** | $20,945/mo | $64/mo | $16/mo | $78/mo | **0.07–0.37%** |
+| **Option B: 3× inf2.48xlarge** | $30,807/mo | $64/mo | $16/mo | $78/mo | **0.05–0.25%** |
+
+The maximum storage cost difference between the cheapest option (hybrid S3+EBS at $16/mo) and the most expensive option (EFS at $78/mo) is **$62/month** — less than **0.30%** of the total project cost. Optimizing for storage cost savings of $48/month while accepting slower restarts and higher operational complexity against a $20,000+/month infrastructure bill is the wrong trade-off.
+
+**The correct strategy is to optimize for performance and simplicity, not storage cost.**
+
+### EBS gp3 IOPS and Latency Analysis
+
+#### What EBS gp3 Delivers
+
+| Metric | gp3 Baseline (included) | gp3 Provisioned (max) | Additional Cost |
+|---|---|---|---|
+| **IOPS** | 3,000 | 16,000 | $0.005/IOPS/mo ($65/mo for max) |
+| **Throughput** | 125 MiB/s | 1,000 MiB/s | $0.04/MiB/s/mo ($35/mo for max) |
+| **Latency** | <1 ms (single-digit microseconds for cached reads) | Same | N/A |
+| **Access pattern** | Full POSIX — sequential, random, read, write | Same | N/A |
+
+#### What Inferentia2 + vLLM Actually Needs
+
+| I/O Phase | Access Pattern | Duration | IOPS Demand | Throughput Demand |
+|---|---|---|---|---|
+| **Model loading** (startup) | Sequential read, 57–68 GB | 2–9 min depending on throughput | Low (~100–500 sequential) | **High** — throughput-bound |
+| **NEFF compilation** (first startup) | Mixed read/write, many small files + large NEFFs | 6–20 min | Moderate (~500–2,000) | Moderate (50–100 MiB/s) |
+| **NEFF cache read** (warm restart) | Sequential read, 20–40 GB | 1–3 min | Low | Moderate (100–125 MiB/s) |
+| **Inference serving** (steady state) | **None** — all data in NeuronCore HBM | Continuous | **Zero** | **Zero** |
+
+Key insight: once the model and NEFF cache are loaded into NeuronCore HBM, the storage volume sees **zero I/O during inference**. Storage performance only matters during startup and compilation — a one-time event per pod lifecycle.
+
+#### Baseline gp3 vs Provisioned gp3
+
+| Scenario | gp3 Baseline (free) | gp3 + Provisioned Throughput | Impact |
+|---|---|---|---|
+| **Model load (68 GB)** | 68 GB / 125 MiB/s ≈ **9 min** | 68 GB / 1,000 MiB/s ≈ **1.1 min** | 8 min faster cold start |
+| **NEFF cache read (30 GB)** | 30 GB / 125 MiB/s ≈ **4 min** | 30 GB / 1,000 MiB/s ≈ **30 sec** | 3.5 min faster warm restart |
+| **NEFF compilation** | CPU-bound (3,000 IOPS sufficient) | No improvement | N/A |
+| **Inference serving** | Zero I/O | Zero I/O | No impact |
+| **Additional cost (per node)** | $0 | $35/mo (1,000 MiB/s) | $140/mo for 4 nodes |
+
+Provisioning 1,000 MiB/s throughput on gp3 costs $35/node/month ($140 total for 4 nodes). This represents **0.67%** of the Option A project cost but cuts warm restart from ~5 min to ~1.5 min and cold start from ~12 min to ~4 min. This is worth it for production deployments where node replacement or pod rescheduling latency matters.
+
+### Recommendation
+
+**Best overall: EBS gp3 per node (with provisioned throughput for production)**
+
+| Use Case | Recommended Storage | IOPS / Throughput | Monthly Storage Cost | Rationale |
+|---|---|---|---|---|
+| **Development / testing** | EBS gp3, 200 GB per node (baseline) | 3,000 IOPS / 125 MiB/s | $16/node | Simplest setup. Baseline throughput is sufficient — compilation is CPU-bound, not I/O-bound. Fastest warm restart (2–5 min). Zero operational complexity. |
+| **Production** | EBS gp3, 200 GB per node (provisioned throughput) | 3,000 IOPS / **1,000 MiB/s** | $51/node | Provisioned throughput cuts model load from 9 min to 1 min and warm restart from 5 min to 1.5 min. At $35/node/month extra (<0.2% of project cost), the startup time improvement is worth it. |
+| **Backup / model registry** | S3 (in addition to EBS) | N/A | $6/mo for 260 GB | S3 as a durable backup for model weights and pre-compiled NEFF cache. Not for serving — only for disaster recovery and model versioning. Download to EBS at pod startup via init container if the PVC is empty. |
+
+**Why EBS gp3 wins over the hybrid approach:**
+
+1. **Fastest restart**: 2–5 min warm (baseline) or 1–2 min (provisioned throughput). No S3 download step.
+2. **Zero runtime I/O**: Once loaded, inference runs entirely in NeuronCore HBM. Storage performance during serving is irrelevant.
+3. **Full POSIX writes**: The Neuron compiler needs random-write access for NEFF artifacts. EBS provides this natively. S3 Mountpoint and S3 API cannot.
+4. **Compilation cache persistence**: NEFF cache survives pod restarts on EBS. S3-only and EFS-with-emptyDir approaches lose the cache and require 6–20 min recompilation.
+5. **Cost is irrelevant**: $64/month (4 nodes × $16) is 0.31% of the $20,945/month project cost. Even with provisioned throughput ($204/month total), storage is under 1%.
+6. **Simplest operations**: No S3 buckets, IAM roles, IRSA configuration, init containers, or CSI drivers beyond the default EBS CSI. Standard Kubernetes PVC.
+
+**When to add S3 (as backup, not primary):**
+
+- Store model weights and pre-compiled NEFF artifacts in S3 as a disaster recovery source. If a node is replaced and its EBS volume is lost, an init container can pull from S3 to a fresh PVC.
+- S3 versioning provides an audit trail of model and NEFF versions. EBS snapshots can serve the same purpose but with less flexibility.
+- This is an operational convenience, not a cost optimization. The S3 cost ($6/month) is negligible.
+
+**Why not EFS?** At $0.30/GB/month, EFS costs 3.75× more than EBS and adds 1–5 ms latency per I/O operation. Its only advantage — ReadWriteMany — is unnecessary because each Inferentia node runs its own model with its own NEFF cache. There is no benefit to sharing volumes across nodes. EFS also loses the NEFF cache on pod restart (stored on emptyDir), forcing 6–20 min recompilation.
+
+**Why not S3 as primary storage?** S3 cannot host the NEFF compilation cache (no POSIX random writes). Using S3 as the primary model source adds a 5–8 min download step on every pod restart. With EBS, the model is already on disk — restart is immediate.
+
+### KServe Integration: Single PVC with Read-Write Annotation (Validated 2026-04-01)
+
+**Recommended approach for RHOAI 3.3+ (KServe 0.14+):** Use a **single EBS gp3 PVC per node** mounted read-write via the `storage.kserve.io/readonly: "false"` annotation on the `InferenceService`. The Neuron compiler writes NEFF cache to a subdirectory (`/mnt/models/neuron-cache`) on the same PVC.
+
+| PVC | Purpose | Size | Access | Monthly Cost |
+|-----|---------|------|--------|-------------|
+| **model-storage-pvc** | Model weights + NEFF compilation cache | 200 GB | Read-write | **$16** |
+
+**Why single PVC?** KServe v0.14+ ([PR #3885](https://github.com/kserve/kserve/pull/3885)) introduced the `storage.kserve.io/readonly: "false"` annotation, which overrides the default read-only PVC mount. RHOAI 3.3 bundles KServe 0.15, which includes this feature. This eliminates the need for a separate NEFF cache PVC while retaining all benefits:
+
+- **Model weights + NEFF cache on one PVC** — simplest architecture, one PVC to manage
+- **NEFF cache persists across restarts** — warm restart in ~9 min (baseline) or ~3-4 min (provisioned throughput)
+- **KServe-native** — model visible in OpenShift AI dashboard, supports traffic management
+
+**Validation (2026-04-01):** The single-PVC approach was validated on the cluster:
+
+| Test | Result |
+|------|--------|
+| PVC mounted read-write by KServe | **PASS** — `ReadOnly: false` confirmed on pod spec |
+| NEFF cache written to PVC | **PASS** — NEFF artifacts written to `/mnt/models/neuron-cache/` |
+| Neuron scheduler propagated | **PASS** — `schedulerName: neuron-scheduler` on underlying Deployment |
+| Autoscaling disabled | **PASS** — `serving.kserve.io/autoscalerClass: none` working correctly |
+| Model serving via KServe | **PASS** — InferenceService became Ready, inference working |
+
+**Legacy: Dual-PVC Architecture (Phase 1b, 2026-03-31):** For pre-RHOAI 3.3 deployments (KServe < 0.14), a dual-PVC approach was validated: model weights on a read-only PVC + NEFF cache on a separate read-write PVC. This adds $4/node/month but works with any KServe version.
+
+See [vLLM on Inferentia2 — KServe Deployment](vllmoninferentia.md#section-3-serving-models-with-kserve-on-inferentia2) for full deployment steps.
 
 ---
 
@@ -382,7 +530,7 @@ Six configurations were tested to cover a range of real-world usage patterns:
 **Test 1: Small (128 in / 128 out)**
 ```bash
 guidellm benchmark run \
-  --target https://vllm-qwen3-coder-llm-serving.apps.rosa.rosa-inf2-48xl.w6qi.p3.openshiftapps.com \
+  --target https://vllm-qwen3-coder-llm-serving.apps.rosa.<CLUSTER_NAME>.<CLUSTER_HASH>.openshiftapps.com \
   --model "Qwen3-Coder-30B-A3B-Instruct" \
   --rate-type sweep \
   --max-seconds 30 \
@@ -393,7 +541,7 @@ guidellm benchmark run \
 **Test 2: Short prompt / Medium response (128 in / 256 out)**
 ```bash
 guidellm benchmark run \
-  --target https://vllm-qwen3-coder-llm-serving.apps.rosa.rosa-inf2-48xl.w6qi.p3.openshiftapps.com \
+  --target https://vllm-qwen3-coder-llm-serving.apps.rosa.<CLUSTER_NAME>.<CLUSTER_HASH>.openshiftapps.com \
   --model "Qwen3-Coder-30B-A3B-Instruct" \
   --rate-type sweep \
   --max-seconds 30 \
@@ -404,7 +552,7 @@ guidellm benchmark run \
 **Test 3: Balanced medium (256 in / 256 out)**
 ```bash
 guidellm benchmark run \
-  --target https://vllm-qwen3-coder-llm-serving.apps.rosa.rosa-inf2-48xl.w6qi.p3.openshiftapps.com \
+  --target https://vllm-qwen3-coder-llm-serving.apps.rosa.<CLUSTER_NAME>.<CLUSTER_HASH>.openshiftapps.com \
   --model "Qwen3-Coder-30B-A3B-Instruct" \
   --rate-type sweep \
   --max-seconds 30 \
@@ -415,7 +563,7 @@ guidellm benchmark run \
 **Test 4: Code generation (512 in / 512 out)**
 ```bash
 guidellm benchmark run \
-  --target https://vllm-qwen3-coder-llm-serving.apps.rosa.rosa-inf2-48xl.w6qi.p3.openshiftapps.com \
+  --target https://vllm-qwen3-coder-llm-serving.apps.rosa.<CLUSTER_NAME>.<CLUSTER_HASH>.openshiftapps.com \
   --model "Qwen3-Coder-30B-A3B-Instruct" \
   --rate-type sweep \
   --max-seconds 30 \
@@ -426,7 +574,7 @@ guidellm benchmark run \
 **Test 5: Large context code review (1024 in / 512 out)**
 ```bash
 guidellm benchmark run \
-  --target https://vllm-qwen3-coder-llm-serving.apps.rosa.rosa-inf2-48xl.w6qi.p3.openshiftapps.com \
+  --target https://vllm-qwen3-coder-llm-serving.apps.rosa.<CLUSTER_NAME>.<CLUSTER_HASH>.openshiftapps.com \
   --model "Qwen3-Coder-30B-A3B-Instruct" \
   --rate-type sweep \
   --max-seconds 30 \
@@ -437,7 +585,7 @@ guidellm benchmark run \
 **Test 6: Large document analysis (2048 in / 1024 out)**
 ```bash
 guidellm benchmark run \
-  --target https://vllm-qwen3-coder-llm-serving.apps.rosa.rosa-inf2-48xl.w6qi.p3.openshiftapps.com \
+  --target https://vllm-qwen3-coder-llm-serving.apps.rosa.<CLUSTER_NAME>.<CLUSTER_HASH>.openshiftapps.com \
   --model "Qwen3-Coder-30B-A3B-Instruct" \
   --rate-type sweep \
   --max-seconds 90 \

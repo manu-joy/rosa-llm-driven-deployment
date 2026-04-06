@@ -1,6 +1,24 @@
 # OpenShift AI Setup Agent Instructions
 
-> **Minimum Version Requirement:** This guide requires **Red Hat OpenShift AI v3.2 or above**. All subscription manifests use the `fast` channel with `startingCSV: rhods-operator.3.2.0` to enforce this minimum. The target OpenShift cluster must be running **OpenShift 4.17+** to support RHOAI 3.2+.
+> **Minimum Version Requirement:** This guide requires **Red Hat OpenShift AI v3.3 or above**. Subscription manifests use the `stable-3.3` channel. The target OpenShift cluster must be running **OpenShift 4.19.9+** (or 4.20/4.21) to support RHOAI 3.3+.
+>
+> **Latest Validated Component Versions (March 2026):**
+>
+> | Component | Version | Notes |
+> |-----------|---------|-------|
+> | ROSA HCP | OCP 4.21.6 | Hosted Control Plane, us-east-2 |
+> | Red Hat OpenShift AI (RHOAI) | 3.3.0 | `stable-3.3` channel, released March 3, 2026 |
+> | KServe (bundled in RHOAI) | 0.15 (GA) | Supports `storage.kserve.io/readonly: "false"` for RW PVC |
+> | OpenShift Service Mesh | 3.2.0 | Auto-installed by RHOAI; Istio 1.26 based |
+> | NFD Operator | 4.20+ | Node Feature Discovery for PCI device labeling |
+> | KMM Operator | 2.6.0 | Kernel Module Management for Neuron drivers |
+> | AWS Neuron Operator | 1.1.1 | Installs device plugin, scheduler, drivers |
+> | AWS Neuron SDK | 2.28.0 | Container: `pytorch-inference-vllm-neuronx:0.13.0-neuronx-py312-sdk2.28.0-ubuntu24.04` |
+> | vLLM | 0.13.0 | With Neuron plugin for Inferentia2 |
+> | NVIDIA GPU Operator | 25.3.3 | For NVIDIA GPU nodes (alternative to Inferentia) |
+> | Authorino Operator | 1.2.1 | Auth for Service Mesh gateway |
+>
+> **Compatibility:** RHOAI 3.3 is supported on OCP 4.19.9+, 4.20, and 4.21, including ROSA HCP. KServe Serverless mode is deprecated in RHOAI 3.3; use **RawDeployment** mode.
 
 ## 🤖 **LLM Role Definition**
 You are an **OpenShift AI Deployment Specialist Agent** with expertise in deploying Red Hat OpenShift AI (RHODS/RHOAI) on ROSA clusters. Your mission is to guide users through a structured, error-free deployment of **OpenShift AI 3.2+** with all necessary dependencies and accelerator support (GPU, AWS Inferentia2, etc.).
@@ -670,16 +688,15 @@ metadata:
   name: rhods-operator
   namespace: openshift-operators
 spec:
-  channel: fast
+  channel: stable-3.3
   installPlanApproval: Automatic
   name: rhods-operator
   source: redhat-operators
   sourceNamespace: openshift-marketplace
-  startingCSV: rhods-operator.3.2.0
 EOF
 
-# NOTE: channel "fast" with startingCSV ensures OpenShift AI 3.2+ is installed.
-# The "stable" channel may still resolve to 2.x versions. Use "fast" for 3.2+.
+# NOTE: "stable-3.3" channel provides RHOAI 3.3 which includes KServe 0.15
+# with read-write PVC support via storage.kserve.io/readonly: "false" annotation.
 
 # Wait for OpenShift AI operator to install
 echo "⏳ Waiting for OpenShift AI operator to install..."
@@ -701,99 +718,317 @@ if ! oc get csv -n openshift-operators | grep rhods | grep -q "Succeeded"; then
     exit 1
 fi
 
-# Create DataScienceCluster to enable all components (CORRECTED NAMESPACE)
+# Create DataScienceCluster — enable only needed components to reduce overhead.
+# Enabled: dashboard, kserve, modelregistry, workbenches
+# Disabled: codeflare, datasciencepipelines, kueue, modelmeshserving, ray, trainingoperator, trustyai
+#
+# NOTE on Models as Service (MaaS): kserve.modelsAsService requires Red Hat Connectivity Link
+# (Kuadrant AuthPolicy CRD). Leave as Removed unless Connectivity Link is installed.
 oc apply -f - <<EOF
 apiVersion: datasciencecluster.opendatahub.io/v1
 kind: DataScienceCluster
 metadata:
   name: default-dsc
-  namespace: openshift-operators
 spec:
   components:
+    codeflare:
+      managementState: Removed
     dashboard:
       managementState: Managed
-    workbenches:
-      managementState: Managed
-    modelmeshserving:
-      managementState: Managed
     datasciencepipelines:
-      managementState: Managed
+      managementState: Removed
     kserve:
       managementState: Managed
+      serving:
+        ingressGateway:
+          certificate:
+            type: SelfSigned
+        managementState: Managed
+        name: knative-serving
     kueue:
-      managementState: Managed
-    codeflare:
+      managementState: Removed
+    modelmeshserving:
+      managementState: Removed
+    modelregistry:
       managementState: Managed
     ray:
-      managementState: Managed
+      managementState: Removed
+    trainingoperator:
+      managementState: Removed
     trustyai:
-      managementState: Managed
-    modelregistry:
+      managementState: Removed
+    workbenches:
       managementState: Managed
 EOF
 
 # Wait for DataScienceCluster to be ready (this may take 10-15 minutes)
-oc wait --for=condition=Ready datasciencecluster/default-dsc -n openshift-operators --timeout=900s
+echo "Waiting for DataScienceCluster..."
+sleep 120
+oc get datasciencecluster default-dsc -o jsonpath='{range .status.conditions[*]}{.type}: {.status}{"\n"}{end}' \
+  | grep -E "DashboardReady|KserveReady|ModelRegistryReady|WorkbenchesReady"
+
+# Enable Model Catalog UI in the dashboard
+oc patch odhdashboardconfig odh-dashboard-config -n redhat-ods-applications \
+  --type merge -p '{"spec":{"dashboardConfig":{"disableModelCatalog":false}}}'
 ```
 
 **Validation Checkpoint:**
 ```bash
 # Verify OpenShift AI components are running
 oc get pods -n redhat-ods-applications
+oc get pods -n rhoai-model-registries
 
-# Get OpenShift AI dashboard URL
-RHODS_URL=$(oc get route rhods-dashboard -n redhat-ods-applications -o jsonpath='{.spec.host}')
-echo "OpenShift AI Dashboard: https://$RHODS_URL"
+# IMPORTANT: RHOAI 3.3 uses a Gateway API approach for the dashboard.
+# Do NOT create a manual route to the dashboard pod — it will return "unauthorized".
+# The correct URL is the gateway route in openshift-ingress:
+DASHBOARD_URL=$(oc get route data-science-gateway -n openshift-ingress -o jsonpath='{.spec.host}')
+echo "OpenShift AI Dashboard: https://$DASHBOARD_URL"
 
-# Verify DataScienceCluster status
-oc get datasciencecluster default-dsc -n openshift-operators -o yaml | grep -A 10 status
+# Verify DataScienceCluster status — all 4 core components should be True:
+oc get datasciencecluster default-dsc -o jsonpath='{range .status.conditions[*]}{.type}: {.status}{"\n"}{end}' \
+  | grep -E "DashboardReady|KserveReady|ModelRegistryReady|WorkbenchesReady"
 ```
 
 ---
 
-#### **Phase 3.3: Enable Model Catalog (Technology Preview)**
+#### **Phase 3.3: Verify Model Registry and Catalog**
 
-**Important:** The model catalog feature provides early access to model registration, deployment, and customization capabilities. It integrates with the model registry for complete model lifecycle management.
+The Model Registry and Model Catalog were enabled in Phase 3.2 via the `modelregistry: Managed` DSC component and the `disableModelCatalog: false` dashboard config patch. This phase verifies they are working.
 
 ```bash
-echo "🔧 Enabling Model Catalog feature..."
+# Verify Model Registry pods are running
+oc get pods -n rhoai-model-registries
 
-# Check if Model Registry component is enabled (should be enabled by default)
-echo "📊 Verifying Model Registry component status:"
-oc get datasciencecluster default-dsc -n openshift-operators -o yaml | grep -A 3 -B 3 "model-registry-operator"
-
-# Enable Model Catalog by setting disableModelCatalog to false
-echo "📊 Configuring dashboard to enable Model Catalog:"
-oc patch odhdashboardconfig odh-dashboard-config -n redhat-ods-applications \
-  --type='merge' -p='{"spec":{"dashboardConfig":{"disableModelCatalog":false}}}'
-
-echo "✅ Model Catalog configuration updated!"
-```
-
-**Validation Checkpoint:**
-```bash
-# Verify the configuration change
-echo "📊 Verifying Model Catalog configuration:"
+# Verify dashboard config
 oc get odhdashboardconfig odh-dashboard-config -n redhat-ods-applications \
   -o jsonpath='{.spec.dashboardConfig}' && echo ""
 
-# Check dashboard pods are ready (may take 1-2 minutes to reload)
-echo "📊 Checking dashboard pod status:"
-oc get pods -n redhat-ods-applications | grep dashboard
-
-echo "✅ Model Catalog enabled successfully!"
-echo "🌐 Access the dashboard and navigate to 'Models' → 'Model catalog'"
-echo "📋 Expected: Model catalog option should appear in the Models navigation menu"
+# Access the dashboard and navigate to "Models > Model catalog"
+DASHBOARD_URL=$(oc get route data-science-gateway -n openshift-ingress -o jsonpath='{.spec.host}')
+echo "Dashboard: https://$DASHBOARD_URL"
+echo "Navigate to: Models > Model catalog"
 ```
 
-**What's Now Available:**
+**What's Available with Model Registry:**
 - **Model Registration**: Register and version models in the model registry
-- **Model Deployment**: Deploy models from the catalog to serving infrastructure
-- **Model Customization**: Customize and fine-tune models for specific use cases
+- **Model Catalog**: Browse and search registered models from the dashboard
 - **Lifecycle Management**: Track model versions, metadata, and deployment history
 - **Integration**: Seamless integration with existing OpenShift AI components
 
 **Note:** Model catalog is a Technology Preview feature that provides early access to upcoming capabilities.
+
+---
+
+#### **Phase 3.4: Register Custom Accelerator Runtimes in Dashboard (AWS Inferentia2)**
+
+RHOAI ships with built-in ServingRuntime templates for NVIDIA GPUs, AMD GPUs, Intel Gaudi, and CPUs. For AWS Inferentia2, you must create a custom template and HardwareProfile.
+
+> **How the dashboard discovers resources (RHOAI 3.3):**
+>
+> | Dashboard Page | Resource Type | Namespace | Key Labels/Annotations |
+> |---------------|---------------|-----------|----------------------|
+> | Model Resources > Serving Runtimes | OpenShift `Template` | `redhat-ods-applications` | `opendatahub.io/dashboard: "true"` |
+> | Settings > Hardware Profiles | `HardwareProfile` CR | `redhat-ods-applications` | `app.opendatahub.io/hardwareprofile: "true"` |
+> | AI Hub > Deployments | `InferenceService` | Any project namespace | `opendatahub.io/dashboard: "true"` |
+> | (Linked to template) | `ServingRuntime` (instance) | Any project namespace | `opendatahub.io/template-name: <template-name>` |
+>
+> **Common mistake:** Creating a `ServingRuntime` in a project namespace does NOT make it appear on the "Serving Runtimes" page. That page only shows OpenShift `Template` objects in `redhat-ods-applications`. The project-level `ServingRuntime` is what KServe uses at runtime, but the template is what the dashboard displays.
+
+**Step 1: Create the vLLM Neuron ServingRuntime Template**
+
+```bash
+cat <<'EOF' | oc apply -f -
+apiVersion: template.openshift.io/v1
+kind: Template
+metadata:
+  name: vllm-neuron-runtime-template
+  namespace: redhat-ods-applications
+  labels:
+    app: odh-dashboard
+    opendatahub.io/dashboard: "true"
+  annotations:
+    description: "vLLM ServingRuntime for AWS Inferentia2 (Neuron SDK). Supports dense and MoE models on NeuronCores."
+    openshift.io/display-name: "vLLM AWS Inferentia2 (Neuron) ServingRuntime for KServe"
+    openshift.io/provider-display-name: "Custom"
+    opendatahub.io/apiProtocol: REST
+    opendatahub.io/model-type: '["generative"]'
+    opendatahub.io/modelServingSupport: '["single"]'
+    tags: "rhoai,kserve,servingruntime,inferentia,neuron,vllm"
+objects:
+- apiVersion: serving.kserve.io/v1alpha1
+  kind: ServingRuntime
+  metadata:
+    name: vllm-neuron-runtime
+    annotations:
+      opendatahub.io/recommended-accelerators: '["aws.amazon.com/neuroncore"]'
+      opendatahub.io/runtime-version: "v0.13.0"
+      openshift.io/display-name: "vLLM AWS Inferentia2 (Neuron) ServingRuntime for KServe"
+    labels:
+      opendatahub.io/dashboard: "true"
+  spec:
+    annotations:
+      prometheus.io/port: "8080"
+      prometheus.io/path: "/metrics"
+    supportedModelFormats:
+      - name: pytorch
+        version: "1"
+        autoSelect: true
+    multiModel: false
+    containers:
+      - name: kserve-container
+        image: public.ecr.aws/neuron/pytorch-inference-vllm-neuronx:0.13.0-neuronx-py312-sdk2.28.0-ubuntu24.04
+        ports:
+          - containerPort: 8080
+            name: http
+            protocol: TCP
+        command:
+          - /bin/bash
+          - -c
+          - |
+            mkdir -p /mnt/models/neuron-cache/compiled /tmp/hf-home
+            vllm serve \
+              --model="/mnt/models" \
+              --served-model-name="${SERVED_MODEL_NAME:-model}" \
+              --tensor-parallel-size="${TP_SIZE:-2}" \
+              --max-num-seqs="${MAX_NUM_SEQS:-4}" \
+              --max-model-len="${MAX_MODEL_LEN:-2048}" \
+              --block-size="${BLOCK_SIZE:-8}" \
+              --no-enable-chunked-prefill \
+              --no-enable-prefix-caching \
+              --port=8080
+        env:
+          - name: VLLM_NEURON_FRAMEWORK
+            value: neuronx-distributed-inference
+          - name: NEURON_COMPILE_CACHE_URL
+            value: /mnt/models/neuron-cache
+          - name: NEURON_COMPILED_ARTIFACTS
+            value: /mnt/models/neuron-cache/compiled
+          - name: HF_HOME
+            value: /tmp/hf-home
+          - name: NEURON_RT_VISIBLE_CORES
+            value: "0-1"
+          - name: FI_EFA_USE_DEVICE_RDMA
+            value: "1"
+          - name: FI_PROVIDER
+            value: "efa"
+        resources:
+          requests:
+            cpu: "4"
+            memory: 16Gi
+            aws.amazon.com/neuroncore: "2"
+          limits:
+            cpu: "8"
+            memory: 32Gi
+            aws.amazon.com/neuroncore: "2"
+        securityContext:
+          capabilities:
+            add:
+              - IPC_LOCK
+              - SYS_ADMIN
+        readinessProbe:
+          httpGet:
+            path: /v1/models
+            port: 8080
+          initialDelaySeconds: 30
+          periodSeconds: 30
+          failureThreshold: 120
+          timeoutSeconds: 10
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 2400
+          periodSeconds: 60
+          failureThreshold: 10
+          timeoutSeconds: 10
+        volumeMounts:
+          - name: hf-cache
+            mountPath: /tmp/hf-home
+          - name: dshm
+            mountPath: /dev/shm
+    volumes:
+      - name: hf-cache
+        emptyDir:
+          sizeLimit: 2Gi
+      - name: dshm
+        emptyDir:
+          medium: Memory
+          sizeLimit: 16Gi
+EOF
+```
+
+**Step 2: Create the Inferentia2 HardwareProfile**
+
+```bash
+cat <<EOF | oc apply -f -
+apiVersion: infrastructure.opendatahub.io/v1
+kind: HardwareProfile
+metadata:
+  name: inferentia2-inf2-24xlarge
+  namespace: redhat-ods-applications
+  labels:
+    app.opendatahub.io/hardwareprofile: "true"
+  annotations:
+    opendatahub.io/display-name: "AWS Inferentia2 (inf2.24xlarge) - 12 NeuronCores"
+    opendatahub.io/description: "AWS Inferentia2 inf2.24xlarge with 12 NeuronCores, 384 GiB RAM."
+    opendatahub.io/disabled: "false"
+    opendatahub.io/dashboard-feature-visibility: '["servingRuntimes","notebookController"]'
+spec:
+  identifiers:
+    - displayName: NeuronCores
+      identifier: aws.amazon.com/neuroncore
+      defaultCount: 8
+      maxCount: 12
+      minCount: 2
+  nodeSelector:
+    node.kubernetes.io/instance-type: inf2.24xlarge
+  tolerations:
+    - key: aws.amazon.com/neuron
+      operator: Exists
+      effect: NoSchedule
+EOF
+```
+
+**Validation Checkpoint:**
+```bash
+# Verify template appears in dashboard's Serving Runtimes page
+oc get template -n redhat-ods-applications | grep neuron
+
+# Verify HardwareProfile appears in dashboard's Settings
+oc get hardwareprofile -n redhat-ods-applications -o custom-columns='NAME:.metadata.name,DISPLAY:.metadata.annotations.opendatahub\.io/display-name'
+
+# Test dashboard access
+DASHBOARD_URL=$(oc get route data-science-gateway -n openshift-ingress -o jsonpath='{.spec.host}')
+echo "Dashboard: https://$DASHBOARD_URL"
+echo "Navigate to: Model Resources > Serving Runtimes — should show 'vLLM AWS Inferentia2 (Neuron)'"
+echo "Navigate to: Settings > Hardware Profiles — should show 'AWS Inferentia2 (inf2.24xlarge)'"
+```
+
+---
+
+#### **Phase 3.5: Deploy Model via KServe with Dashboard Integration**
+
+When deploying a model in a project namespace, ensure the `ServingRuntime` and `InferenceService` have the correct labels to appear in the dashboard:
+
+```bash
+# Project-level ServingRuntime must link to the template
+# Key labels:
+#   opendatahub.io/dashboard: "true"           — visible in dashboard
+#   opendatahub.io/template-name: vllm-neuron-runtime-template  — links to template
+
+# InferenceService must have:
+#   label: opendatahub.io/dashboard: "true"     — appears in AI Hub > Deployments
+#   annotation: serving.kserve.io/deploymentMode: RawDeployment
+#   annotation: storage.kserve.io/readonly: "false"  — enables read-write PVC (KServe 0.14+)
+#   annotation: serving.kserve.io/autoscalerClass: none — disables autoscaling
+#   spec: schedulerName: neuron-scheduler       — Neuron topology-aware scheduling
+
+# Route must target port 8080 (not service port 80):
+#   spec.port.targetPort: 8080
+#   The KServe predictor service is headless (ClusterIP: None), so targetPort must match the container port.
+```
+
+See [vllmoninferentia.md Step 9-KServe](vllmoninferentia.md) for the complete YAML manifests.
 
 ---
 
@@ -2386,15 +2621,14 @@ metadata:
   name: rhods-operator
   namespace: redhat-ods-operator
 spec:
-  channel: fast
+  channel: stable-3.3
   installPlanApproval: Automatic
   name: rhods-operator
   source: redhat-operators
   sourceNamespace: openshift-marketplace
-  startingCSV: rhods-operator.3.2.0
 EOF
 
-# NOTE: startingCSV ensures minimum version 3.2.0 is installed.
+# NOTE: stable-3.3 channel provides RHOAI 3.3 with KServe 0.15 (read-write PVC support).
 # Verify with: oc get csv -n redhat-ods-operator | grep rhods
 
 # Wait for OpenShift AI operator to be ready
