@@ -212,19 +212,19 @@ Request Flow:
 
 ### Deployment View (Layered Architecture)
 
-Application/Workload → Operator/Driver → Platform → Infrastructure layers showing the complete deployment stack.
+Four-layer left-to-right flow: **Application/Workload** (Dev Spaces → Service Mesh Gateway → llm-d EPP → vLLM Pods) → **Operator/Driver** (11 operators including RHOAI/KServe, GPU Operator, Neuron Operator, Service Mesh, NFD, cert-manager, KMM, LeaderWorkerSet) → **Platform** (ROSA HCP 4.21) → **Infrastructure** (AWS EC2 + EBS + NVMe). Note: llm-d is not an operator -- it is CRDs and controllers deployed by RHOAI/KServe.
 
 ![Deployment View](architecture-deployment-view.svg)
 
 ### AWS Architectural View
 
-Standard AWS architecture diagram showing the Region, Availability Zones, VPC, subnets, Internet Gateway, NLB, and EC2 worker nodes with their accelerators.
+Enterprise private connectivity design: developers on **customer premises** connect via **AWS Direct Connect** (dedicated circuit) through a **Transit Gateway** to the **ROSA VPC**. An internal **NLB** distributes traffic to worker nodes across three Availability Zones. The Kubernetes API is accessible via **AWS PrivateLink**. No Internet Gateway -- source code never traverses the public internet.
 
 ![AWS View](architecture-aws-view.svg)
 
 ### Red Hat Components View
 
-OpenShift-centric view showing all software components inside the cluster boundary, with external AWS infrastructure outside. Namespaces, operators, pods, services, and their relationships.
+OpenShift-centric view: **external** components (developers, AWS NLB, EC2 nodes, EBS/NVMe storage) sit outside the cluster boundary. **All software components** -- Dev Spaces, Service Mesh Gateway, llm-d EPP, vLLM pods, 11 operators, platform services -- reside inside the OpenShift cluster. Organized by namespace: `openshift-devspaces`, `openshift-ingress`, `llm-d-multi-gpu`, plus operator namespaces.
 
 ![Red Hat View](architecture-redhat-view.svg)
 
