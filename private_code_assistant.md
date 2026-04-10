@@ -206,9 +206,27 @@ Request Flow:
 
 ### Architecture Diagram (SVG — Landscape)
 
-> **Tip:** Open `architecture-diagram.svg` directly for full-resolution rendering, or view inline below.
+> **Tip:** Open each `.svg` file directly for full-resolution rendering, or view inline below.
 
 ![Architecture Diagram](architecture-diagram.svg)
+
+### Deployment View (Layered Architecture)
+
+Application/Workload → Operator/Driver → Platform → Infrastructure layers showing the complete deployment stack.
+
+![Deployment View](architecture-deployment-view.svg)
+
+### AWS Architectural View
+
+Standard AWS architecture diagram showing the Region, Availability Zones, VPC, subnets, Internet Gateway, NLB, and EC2 worker nodes with their accelerators.
+
+![AWS View](architecture-aws-view.svg)
+
+### Red Hat Components View
+
+OpenShift-centric view showing all software components inside the cluster boundary, with external AWS infrastructure outside. Namespaces, operators, pods, services, and their relationships.
+
+![Red Hat View](architecture-redhat-view.svg)
 
 ## Frontend: Developer IDE Environment
 
