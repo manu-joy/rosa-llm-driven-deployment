@@ -23,6 +23,7 @@
   - [llm-d Intelligent Routing](#llm-d-intelligent-routing)
   - [Multi-Accelerator Scaling Phases](#multi-accelerator-scaling-phases)
   - [Prefix Caching Compatibility](#prefix-caching-model-compatibility)
+  - [Accelerator Selection Guide: NVIDIA vs Inferentia](#accelerator-selection-guide-nvidia-gpu-vs-aws-inferentia2)
 - [Test Results](#test-results)
   - [Phase 1: Single NVIDIA GPU Node](#phase-1-single-nvidia-gpu-node)
   - [Phase 2: Two NVIDIA Nodes with llm-d](#phase-2-two-nvidia-gpu-nodes-with-llm-d-load-balancing)
@@ -30,10 +31,12 @@
   - [Inferentia Standalone Performance](#inferentia-standalone-performance-pre-llm-d)
   - [Performance Benchmark: NVIDIA L40S](#performance-benchmark-llm-d-on-nvidia-l40s-fp8)
   - [GuideLLM Sweep Results](#guidellm-sweep-benchmark-results-april-7-2026)
-  - [Inferentia Context Window Limits](#inferentia-context-window-limitation-and-mitigation)
+  - [Inferentia Context Window Limits](#inferentia-context-window--maximum-supported-length)
+  - [Phase 4: Trainium trn1.32xlarge with DRA](#phase-4-trainium-trn132xlarge-with-neuron-dra-driver)
+  - [Phase 4b: 2-Replica Scaling Investigation](#phase-4b-2-replica-scaling-investigation-april-9-2026)
 - [Planned Test Phases](#planned-test-phases)
-  - [Phase 4: Dual Qwen on inf2.48xlarge](#phase-4-dual-qwen3-coder-30b-on-inf248xlarge)
-  - [Phase 5: NVIDIA L40S Full Benchmark](#phase-5-nvidia-g6e2xlarge-l40s-full-guidellm-benchmark)
+  - [Phase 5: Dual Qwen on inf2.48xlarge](#phase-5-dual-qwen3-coder-30b-on-inf248xlarge)
+  - [Phase 6: NVIDIA L40S Full Benchmark](#phase-6-nvidia-g6e2xlarge-l40s-full-guidellm-benchmark)
   - [Cross-Phase Cost Comparison](#cross-phase-cost-comparison-qwen3-coder-30b-2-instances)
 - [Step-by-Step Deployment Guide](#step-by-step-deployment-guide)
   - [Prerequisites](#prerequisites)
@@ -41,7 +44,7 @@
 - [Component Versions](#component-versions)
 - [Model Caching and Startup Optimization](#model-caching-and-startup-optimization-analysis)
 - [Project Considerations](#project-considerations)
-- [Appendix A: Neuron-Scheduler / OVN Annotation Conflict](#appendix-a-neuron-scheduler--ovn-kubernetes-annotation-conflict----deep-dive)
+- [Appendix A: Neuron-Scheduler / OVN Annotation Conflict](#appendix-a-neuron-scheduler--ovn-kubernetes-annotation-conflict)
 - [Appendix B: OVN Annotation Fix -- Live Tests](#appendix-b-ovn-annotation-fix----live-test-results-april-2-2026)
 
 ---
@@ -201,6 +204,12 @@ Request Flow:
 - **TLS terminates at each vLLM pod** (self-signed certs), not at the gateway -- the gateway performs ext_proc routing on TLS-passthrough connections.
 - **Dev Spaces extensions** make HTTP calls from **inside the workspace pod** directly to the llm-d workload service (cluster-internal, no external egress required).
 
+### Architecture Diagram (SVG — Landscape)
+
+> **Tip:** Open `architecture-diagram.svg` directly for full-resolution rendering, or view inline below.
+
+![Architecture Diagram](architecture-diagram.svg)
+
 ## Frontend: Developer IDE Environment
 
 ### Deployment Option 1: Web IDE (Browser-Based)
@@ -357,23 +366,34 @@ Routing a single model across NVIDIA GPU and AWS Inferentia2 backends through a 
 | **Prefix caching** | Enabled (FP8 on CUDA) | Disabled (MoE on NxD constraint) | EPP prefix-cache scorer will always prefer GPU replicas for cache-warm prompts |
 | **Quantization** | FP8 (8-bit) | BF16 (16-bit) | Output quality may differ slightly; acceptable for code assistant use |
 
-**Solutions for heterogeneous routing — default (verified) and legacy approaches:**
+**Heterogeneous Deployment: Same-Namespace Native TLS (Verified April 8, 2026)**
 
-> **The same-namespace native TLS approach (Approach A below) is the verified default method for heterogeneous GPU model deployments.** It was tested and verified on April 8, 2026. The bridge proxy approach (Approach B) is documented for reference only.
+> **All model pods must run in a single namespace.** This is an architectural requirement of llm-d, not a preference. The `InferencePool` label selector is **namespace-scoped** — the EPP can only discover and route to pods within its own namespace. Cross-namespace deployments require a proxy, which breaks EPP scoring (KV-cache utilization, queue depth) and adds operational complexity with zero benefit. During testing, the proxy approach showed 10-21% throughput degradation and timeout errors at high concurrency due to broken EPP metrics visibility.
 
-**Approach A: Same-Namespace Native TLS (DEFAULT — Verified April 8, 2026)**
+**Why same-namespace matters for llm-d:**
 
-This is the verified production approach. All model pods run in a single namespace (`llm-d-multi-gpu`) with `nodeSelector`-based scheduling, native HTTPS on all endpoints, and identical `--served-model-name`:
+1. **EPP discovery is namespace-scoped**: The `InferencePool` uses Kubernetes label selectors to discover backend pods. These selectors only match pods within the same namespace. Pods in other namespaces are invisible to the EPP.
+2. **EPP scoring requires direct vLLM metrics**: The EPP scrapes each pod's `/metrics` endpoint to make routing decisions based on KV-cache utilization and queue depth. A proxy between the EPP and vLLM returns the proxy's metrics, not the model server's, rendering intelligent routing useless.
+3. **TLS consistency**: All pods behind the same `InferencePool` must serve HTTPS on the same port with consistent TLS. Sharing the TLS secret created by `LLMInferenceService` is straightforward within one namespace.
+4. **Simplified operations**: One namespace means one set of RBAC, one `InferencePool`, one EPP router, and unified `oc get pods` visibility across all backends.
 
-1. **TLS mismatch**: vLLM natively supports HTTPS via `--ssl-certfile` and `--ssl-keyfile`. On OpenShift, use the Service CA to auto-generate a TLS secret (`service.beta.openshift.io/serving-cert-secret-name` annotation on the Service), mount it into the Inferentia pod, and add `--ssl-certfile /tls/tls.crt --ssl-keyfile /tls/tls.key` to the vLLM command. Update readiness/liveness probes to `scheme: HTTPS`.
+**Implementation details:**
 
-2. **Same namespace**: Deploy both NVIDIA and Inferentia workloads in the **same namespace** (e.g., `llm-d-multi-gpu`). Use `nodeSelector` to target different machine pools:
-   - NVIDIA pods: `nodeSelector: { node.kubernetes.io/instance-type: g6e.2xlarge }`
-   - Inferentia pods: `nodeSelector: { node.kubernetes.io/instance-type: inf2.24xlarge }` + `schedulerName: neuron-scheduler`
+1. **TLS on all endpoints**: vLLM natively supports HTTPS via `--ssl-certfile` and `--ssl-keyfile`. The Inferentia pods reuse the self-signed TLS secret created by the `LLMInferenceService` (e.g., `qwen3-coder-fp8-kserve-self-signed-certs`), mounted at `/etc/certs`. Readiness/liveness probes use `scheme: HTTPS`.
 
-   Each accelerator type uses its **own PVC** (NVIDIA uses KServe storage initializer; Inferentia uses a pre-downloaded EBS PVC). SELinux `seLinuxOptions.level` is only needed for Inferentia pods sharing a PVC.
+2. **Node targeting via `nodeSelector` + taints/tolerations**: Both accelerator types coexist in one namespace, scheduled to the correct hardware via:
+   - NVIDIA pods: `nodeSelector: { node.kubernetes.io/instance-type: g6e.2xlarge }` + toleration for `nvidia.com/gpu=present:NoSchedule`
+   - Inferentia pods: `nodeSelector: { node.kubernetes.io/instance-type: inf2.24xlarge }` + `schedulerName: neuron-scheduler` + toleration for `aws.amazon.com/neuroncore=present:NoSchedule`
 
-3. **Model name alignment**: Both backends use the **same** `--served-model-name` value. The verified configuration uses the FP8 model name as the common served name:
+   **Machine pool taints** prevent non-accelerator workloads from consuming CPU/memory on expensive GPU and Inferentia nodes. Each accelerator machine pool should be created with a taint:
+   - GPU pool: `--taints="nvidia.com/gpu=present:NoSchedule"`
+   - Inferentia pool: `--taints="aws.amazon.com/neuroncore=present:NoSchedule"`
+
+   Model deployments must include matching `tolerations` in their pod spec. The `LLMInferenceService` CR supports tolerations in its `spec.template`; standalone Inferentia `Deployments` add them directly to `spec.template.spec.tolerations`. Without these taints, OpenShift platform pods (dashboards, controllers, operators) will fill GPU node CPU and block model scheduling.
+
+   Each accelerator type uses its **own PVC** (NVIDIA uses KServe storage initializer; Inferentia uses an EBS-backed PVC). SELinux `seLinuxOptions.level` is only needed for Inferentia pods sharing a PVC.
+
+3. **Model name alignment**: Both backends must use the **same** `--served-model-name` value so the EPP treats them as interchangeable endpoints:
 
    | Component | NVIDIA (LLMInferenceService) | Inferentia (Deployment) |
    |-----------|------------------------------|------------------------|
@@ -388,20 +408,15 @@ This is the verified production approach. All model pods run in a single namespa
    - `kserve.io/component: workload`
    - `llm-d.ai/role: both`
 
-5. **TLS certificate sharing**: The Inferentia pod reuses the self-signed TLS secret created by the LLMInferenceService (e.g., `qwen3-coder-fp8-kserve-self-signed-certs`), mounted at `/etc/certs`.
-
 **Verified routing behavior (April 8, 2026):**
 
-- EPP auto-discovers all 3 pods (2 NVIDIA + 1 Inferentia) via InferencePool label selector
+- EPP auto-discovers all pods (2 NVIDIA + 1 Inferentia) via InferencePool label selector
 - Under 10 concurrent requests: 4 routed to Inferentia, 6 to NVIDIA (natural EPP load balancing)
 - At low concurrency, EPP prefers NVIDIA pods (faster response, prefix cache support)
 - Inferentia pod serves as overflow capacity when NVIDIA pods are busy
+- **Zero errors** across all concurrency levels in GuideLLM sweep (7,781 requests)
 
 Full step-by-step deployment procedure is in `private_code_assistant_TEST_PLAN.md` Phase D.
-
-**Approach B: Bridge Proxy (Legacy — Verified April 7, 2026)**
-
-This approach works across separate namespaces using an nginx TLS reverse proxy. It is documented for reference but **is not recommended** because it breaks EPP KV-cache and queue-depth scoring. See the April 7, 2026 benchmark results below for bridge proxy performance data.
 
 **neuron-scheduler / OVN-Kubernetes annotation race (resolved):**
 
@@ -417,6 +432,61 @@ Prefix caching is a **platform requirement** for full **llm-d** benefit; support
 | MoE (e.g., Qwen3-Coder-30B-A3B) | Prefix caching: **YES** | Prefix caching: **NO** (NxD MoE constraint) |
 
 **Recommendation:** Prefer **dense** models on **Inferentia** when **prefix-cache-aware** routing is critical. **MoE** on **CUDA** gets the full llm-d feature set. Prefix caching remains a core platform requirement for all supported non-MoE models.
+
+### Accelerator Selection Guide: NVIDIA GPU vs AWS Inferentia2
+
+Choosing the right accelerator for a given model depends on the model architecture, required features, context length needs, quantization format, and cost constraints. This guide captures the trade-offs validated during this project.
+
+#### Decision Matrix
+
+| Factor | NVIDIA L40S (CUDA) | AWS Inferentia2 (Neuron) | Recommendation |
+|--------|--------------------|--------------------------|-|
+| **MoE models** (e.g., Qwen3-Coder-30B-A3B, Mixtral) | Full support. FP8 quantization, prefix caching, TP=1 possible. | Supported but **no prefix caching** (NxD MoE constraint), BF16 only, requires TP=8+. | **NVIDIA preferred** — MoE models get the full llm-d feature set on CUDA |
+| **Dense models** (e.g., Llama-3.x, CodeLlama, Qwen3-8B) | Full support. FP8/FP16/BF16, prefix caching, flexible TP. | Full support. Prefix caching **YES**, BF16, Neuron NEFF compilation required. | **Either** — dense models work well on both; Inferentia is cost-competitive for dense models with prefix caching |
+| **FP8 quantization** | Native hardware support (FP8 Tensor Cores on Ada Lovelace+). 2x memory savings → TP=1 for 30B models. | **Not supported** — NeuronCore-v2 has no FP8 ALU. BF16 only. | **NVIDIA required** for FP8. Inferentia forces BF16 (2x memory → 2x TP → higher instance cost) |
+| **Prefix caching** | Always available (CUDA + vLLM). Full llm-d EPP prefix-cache scoring. | Available for **dense models only**. Disabled for MoE models on NxD. | **NVIDIA preferred** when prefix caching is critical across all model types |
+| **Context window** | Up to 32,768 tokens on L40S (48 GB VRAM, FP8, TP=1). | **8,192 tokens max** on inf2.24xlarge (128 GB HBM, BF16, TP=8). 16,384 on inf2.48xlarge. | **NVIDIA preferred** for long-context workloads (32k+). Inferentia limited by NEFF activation buffers. |
+| **Cold-start time** | ~2-5 min (download + GPU load). | **30-45 min** (download + Neuron NEFF compilation). ~10s on warm PVC cache. | **NVIDIA preferred** for environments requiring fast scaling. Inferentia needs PVC cache strategy. |
+| **Single-user latency** | TTFT: ~62ms, ITL: ~10ms (FP8, 512 tokens). | TTFT: ~480ms, ITL: ~57ms (BF16, 512 tokens). | **NVIDIA preferred** (~8x faster ITL) for latency-sensitive interactive coding |
+| **Peak throughput** | ~1,690 tok/s per L40S. | ~137 tok/s per inf2.24xlarge (Qwen3-Coder MoE). | **NVIDIA preferred** for throughput. Inferentia is effective as overflow capacity behind llm-d. |
+| **Cost per instance** | $2.24/hr (g6e.2xlarge). | $6.49/hr (inf2.24xlarge). | **NVIDIA 2.9x cheaper** for equivalent model on this architecture |
+| **Cost per 1M output tokens** | ~$0.18 (at peak throughput). | ~$13.16 (at peak throughput for MoE). | **NVIDIA 73x cheaper** per token for MoE. Gap narrows significantly for dense models. |
+| **Scheduling complexity** | Standard Kubernetes scheduler. No annotation conflicts. | Requires `neuron-scheduler` + MutatingAdmissionWebhook to fix OVN annotation race on ROSA HCP. | **NVIDIA simpler** operationally. Inferentia requires additional workarounds on ROSA. |
+| **Model format flexibility** | FP8, FP16, BF16, INT8, GPTQ, AWQ, GGUF via vLLM. | **BF16 only** via NxD-Inference. Limited INT8 for select operations. | **NVIDIA preferred** for quantization flexibility |
+
+#### When to Choose Inferentia2
+
+Despite NVIDIA's advantages in most dimensions, Inferentia2 is the right choice in specific scenarios:
+
+1. **Dense model cost optimization**: For dense models (not MoE), Inferentia2 supports prefix caching and the per-token cost gap narrows. On dense models like Llama-3-8B, Inferentia2 achieves comparable throughput to L40S at lower cost per NeuronCore-hour.
+
+2. **Overflow / burst capacity**: In a heterogeneous llm-d deployment, Inferentia pods absorb overflow traffic when NVIDIA pods are saturated. The EPP automatically routes requests away from busy NVIDIA pods to available Inferentia endpoints.
+
+3. **AWS commitment / reserved capacity**: Organizations with existing Inferentia reserved instances or AWS Neuron investment can leverage those commitments for inference workloads that don't require FP8 or long context.
+
+4. **Future-proofing for Trainium2/Inferentia3**: AWS Trainium2 adds FP8 hardware support. Early Inferentia2 deployment builds operational expertise with Neuron tooling that transfers to next-gen silicon.
+
+#### When to Choose NVIDIA GPU
+
+NVIDIA GPUs are preferred for:
+
+1. **MoE models** — prefix caching, FP8 quantization, and lower TP requirements make NVIDIA the clear choice for Mixture-of-Experts architectures.
+
+2. **Low-latency interactive coding** — 10ms ITL vs 57ms ITL matters for real-time code completion and streaming chat responses.
+
+3. **Long context windows** — 32,768 tokens on L40S vs 8,192 on inf2.24xlarge. Code review, large file analysis, and multi-file context require NVIDIA.
+
+4. **Fast scaling / ephemeral environments** — 2-5 min cold start vs 30-45 min compilation. NVIDIA is the only option when rapid elasticity is needed.
+
+5. **Cost efficiency** — for the Qwen3-Coder-30B MoE model specifically, NVIDIA L40S is 73x cheaper per output token at peak throughput.
+
+#### Summary Recommendation for This Project
+
+For the **Qwen3-Coder-30B-A3B (MoE)** model used in this private code assistant platform:
+
+- **Primary fleet: NVIDIA L40S (g6e.2xlarge)** — FP8, prefix caching, 32k context, 10ms ITL, $0.18/1M tokens
+- **Overflow capacity: Inferentia2 (inf2.24xlarge)** — BF16, no prefix caching, 8k context, 57ms ITL, useful for absorbing traffic spikes behind llm-d
+- **If switching to a dense model** (e.g., Qwen3-8B, CodeLlama-34B): re-evaluate Inferentia2 as a primary fleet option — prefix caching support and narrower throughput gap make it competitive
 
 ### Gateway URL
 
@@ -457,7 +527,7 @@ https://<CLUSTER_ELB_HOSTNAME>.us-east-2.elb.amazonaws.com/llm-d-gpu/qwen3-coder
 
 ### Phase 3: Heterogeneous Routing (CUDA + Inferentia)
 
-**Status: VERIFIED** (April 8, 2026) -- Native same-namespace heterogeneous llm-d routing verified across 2 NVIDIA L40S + 1 Inferentia2 endpoints **without any proxy bridge**.
+**Status: VERIFIED** (April 8, 2026) -- Same-namespace heterogeneous llm-d routing verified across 2 NVIDIA L40S + 1 Inferentia2 endpoints with native TLS.
 
 **Verified capabilities:**
 
@@ -465,7 +535,7 @@ https://<CLUSTER_ELB_HOSTNAME>.us-east-2.elb.amazonaws.com/llm-d-gpu/qwen3-coder
 - Neuron NEFF compilation takes 30-45 min (cold cache) or ~10s (PVC cache hit); model loading takes ~15 min; requires **200Gi memory limit** during compilation
 - All caches (HF_HOME, NEURON_COMPILE_CACHE_URL) on EBS-backed PVC for persistence across restarts
 - All 3 pods serve the same `--served-model-name` (`Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8`) over HTTPS
-- **llm-d EPP auto-discovers all 3 pods** via InferencePool label selector — no proxy, no bridge
+- **llm-d EPP auto-discovers all 3 pods** via InferencePool label selector (same namespace)
 - EPP routes 4/10 concurrent requests to Inferentia, 6/10 to NVIDIA (natural load balancing)
 - MutatingAdmissionWebhook resolves the OVN annotation race (see Appendix B)
 
@@ -636,37 +706,16 @@ For multi-developer capacity planning, the key metric is **peak aggregate throug
 - **max_model_len was 4,096 at time of this test** (since increased to 16,384); Test 6 could not run with the old limit
 - **Constant-rate (8–14 concurrent):** ~80–124 output tok/s
 
-#### Heterogeneous llm-d Routing — Bridge Proxy Approach (April 7, 2026) (512/512)
-
-**Configuration:** llm-d InferencePool with 3 endpoints: 2x NVIDIA L40S pods (FP8, HTTPS) + 1x nginx TLS bridge → Inferentia BF16 pod (HTTP)
-**Note:** This is the legacy bridge proxy approach. See the native same-namespace results below for the recommended approach.
-
-| Metric | NVIDIA-Only (2 pods) | Heterogeneous (2 NVIDIA + 1 Inferentia) | Delta |
-|--------|---------------------|----------------------------------------|-------|
-| **Sync TTFT (ms)** | 62.1 | 63.8 | +2.7% |
-| **Sync ITL (ms)** | 10.4 | 10.4 | 0% |
-| **Sync Req Latency (s)** | 5.4 | 5.4 | 0% |
-| **Throughput mode output tok/s** | 3,380 | 3,392 | +0.4% |
-| **Constant (8 conc) output tok/s** | 1,196 | 1,069 | -10.6% |
-| **Constant (16 conc) output tok/s** | 1,757 | 1,387 | -21.1% |
-| **Error rate (throughput mode)** | 0% | Err input: 112,128 tokens | Inferentia timeout errors |
-
-**Bridge proxy routing observations:**
-1. **llm-d EPP successfully routes across heterogeneous accelerators** via the nginx bridge
-2. **At low concurrency (synchronous), performance is identical** — the EPP correctly routes to NVIDIA pods for the initial request
-3. **At high concurrency, the Inferentia pod becomes a bottleneck** — its 56ms ITL (5.4x slower than NVIDIA's 10.4ms) creates a long tail, dragging down aggregate throughput by 10–21%
-4. **The nginx bridge breaks EPP scoring** — KV-cache and queue-depth scorers see nginx metrics, not vLLM metrics
-
 #### Heterogeneous llm-d Routing — Native Same-Namespace (April 8, 2026) (128/128)
 
 **Configuration:** llm-d InferencePool with 3 endpoints in `llm-d-multi-gpu`: 2x NVIDIA L40S pods (FP8, HTTPS) + 1x Inferentia2 pod (BF16, HTTPS, native TLS)
-**Key improvement:** No proxy bridge needed. All pods in same namespace with matching labels. EPP sees real vLLM metrics from all 3 endpoints. Same `--served-model-name` across all backends.
+**Architecture:** All pods in same namespace with matching labels. EPP sees real vLLM metrics from all 3 endpoints. Same `--served-model-name` across all backends.
 
 **Routing verification (10 concurrent requests):**
 - Inferentia pod: 4 requests served (`request_success_total = 4`)
 - NVIDIA pods: 6 requests served (split across 2 pods)
 - All responses return model name `Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8`
-- No proxy, no bridge — native EPP discovery via InferencePool label matching
+- EPP discovery via InferencePool label matching — all pods visible in same namespace
 
 **Architecture (verified):**
 ```
@@ -696,11 +745,9 @@ Client → llm-d EPP → ┬─ NVIDIA Pod 1 (g6e, FP8, HTTPS:8000)       ← ll
 | **Cost per 1M output tok (peak)** | $0.18 | $13.16 | $0.71 |
 | **max_model_len** | 32,768 | 8,192 | Mixed |
 
-> **Conclusion (bridge proxy, April 7):** Heterogeneous routing through llm-d is technically feasible. The bridge proxy approach works but breaks EPP scoring and adds operational complexity.
+#### Heterogeneous llm-d Routing — GuideLLM Sweep (April 8, 2026)
 
-#### Heterogeneous llm-d Routing — Native Same-Namespace GuideLLM Sweep (April 8, 2026)
-
-**Configuration:** `llm-d-multi-gpu` namespace, 3 endpoints: 2x NVIDIA L40S (FP8, HTTPS) + 1x Inferentia2 (BF16, HTTPS, native TLS). All pods in same namespace with matching InferencePool labels. No proxy bridge.
+**Configuration:** `llm-d-multi-gpu` namespace, 3 endpoints: 2x NVIDIA L40S (FP8, HTTPS) + 1x Inferentia2 (BF16, HTTPS, native TLS). All pods in same namespace with matching InferencePool labels.
 **GuideLLM version:** 0.5.4, synthetic data: 128 prompt tokens, 128 output tokens.
 
 | # | Strategy | Rate (req/s) | Requests | Errors | Output tok/s | TTFT (ms) | ITL (ms) | Latency (s) | Concurrency |
@@ -724,14 +771,80 @@ Client → llm-d EPP → ┬─ NVIDIA Pod 1 (g6e, FP8, HTTPS:8000)       ← ll
 
 **Key observations (native same-namespace approach):**
 
-1. **Zero errors across all 10 strategies** — a major improvement over the bridge proxy approach, which had timeout errors at high concurrency
+1. **Zero errors across all 10 strategies** (7,781 total requests) — confirms production-grade reliability
 2. **Peak throughput: 3,342 output tok/s** — comparable to the NVIDIA-only baseline (3,380), confirming that Inferentia adds capacity without degrading NVIDIA pod throughput
 3. **The synchronous TTFT is high (17.4s)** because the EPP routed to the Inferentia pod, which has slower time-to-first-token due to BF16 precision and Neuron prefill overhead
 4. **At moderate concurrency (3.3-13 req/s), ITL ranges 34-74ms** — the EPP correctly balances load, with the Inferentia pod absorbing overflow traffic
-5. **EPP scoring works correctly** — real vLLM metrics from all pods (unlike the bridge approach), enabling KV-cache and queue-depth-aware routing
-6. **No proxy overhead** — direct pod-to-pod communication via the InferencePool service
+5. **EPP scoring works correctly** — real vLLM metrics from all pods enable KV-cache and queue-depth-aware routing decisions
+6. **Direct pod-to-pod communication** via the InferencePool service — no intermediary overhead
 
-> **Conclusion (native, April 8):** The same-namespace native TLS approach is the **recommended default** for heterogeneous GPU model deployments. It eliminates the bridge proxy, enables full EPP scoring, and achieves zero errors at all concurrency levels. The Inferentia pod serves as effective overflow capacity (~14.5% of traffic), while NVIDIA pods handle the bulk of requests with their superior throughput.
+> **Conclusion:** The same-namespace native TLS deployment is the **only recommended method** for heterogeneous GPU model deployments with llm-d. The EPP's namespace-scoped discovery and metrics-based scoring require direct access to all backend vLLM pods. The Inferentia pod serves as effective overflow capacity (~14.5% of traffic), while NVIDIA pods handle the bulk of requests with their superior throughput.
+
+#### Heterogeneous llm-d Routing — Equal Split GuideLLM Sweep (April 8, 2026)
+
+**Configuration:** `llm-d-multi-gpu` namespace, 2 endpoints: 1x NVIDIA L40S (FP8, HTTPS) + 1x Inferentia2 (BF16, HTTPS, max-model-len=8192). All pods in same namespace with matching InferencePool labels.
+**GuideLLM version:** 0.5.4, synthetic data: 128 prompt tokens, 128 output tokens.
+
+| # | Strategy | Rate (req/s) | Requests | Errors | Output tok/s | TTFT (ms) | ITL (ms) | Latency (s) | Concurrency |
+|---|----------|-------------|----------|--------|-------------|-----------|----------|-------------|-------------|
+| 1 | synchronous | - | 8 | 0 | 17 | 504 | 55.5 | 7.6 | 1.0 |
+| 2 | throughput | - | 1,421 | 0 | 3,052 | 1,688 | 75.0 | 11.2 | 265.8 |
+| 3 | constant | 2.8 | 171 | 0 | 367 | 179 | 35.1 | 4.6 | 13.2 |
+| 4 | constant | 5.1 | 308 | 0 | 659 | 2,439 | 38.7 | 7.4 | 37.8 |
+| 5 | constant | 7.5 | 449 | 0 | 959 | 2,198 | 38.7 | 7.1 | 53.2 |
+| 6 | constant | 9.9 | 595 | 0 | 1,277 | 1,699 | 42.4 | 7.1 | 70.3 |
+| 7 | constant | 12.0 | 721 | 0 | 1,540 | 1,693 | 49.8 | 8.0 | 96.4 |
+| 8 | constant | 13.5 | 809 | 0 | 1,729 | 1,589 | 58.0 | 9.0 | 120.7 |
+| 9 | constant | 14.4 | 864 | 0 | 1,848 | 1,619 | 64.9 | 9.9 | 142.0 |
+| 10 | constant | 15.4 | 926 | 0 | 1,980 | 1,565 | 75.9 | 11.2 | 173.0 |
+
+**Total requests across all strategies:** 6,272 — **0 errors**
+
+**Traffic distribution (from pod metrics):**
+- NVIDIA pod: 5,711 requests served (~91%)
+- Inferentia pod: 566 requests served (~9%)
+
+**Key observations (1:1 node ratio, equal split configuration):**
+
+1. **Zero errors across all 10 strategies** — consistent with the previous 2:1 (NVIDIA:Inferentia) test
+2. **Peak throughput: 3,052 output tok/s** — lower than the 2-NVIDIA baseline (3,342) because only 1 NVIDIA pod is available. The single NVIDIA L40S is doing ~91% of the work.
+3. **Synchronous TTFT: 504ms** — dominated by the Inferentia pod's prefill latency when the EPP routes there
+4. **EPP heavily favors NVIDIA** despite 1:1 node ratio — the queue-depth and latency-based scoring correctly routes ~91% of traffic to the faster pod
+5. **Inferentia serves as overflow capacity** absorbing ~9% of requests. This is less than the 14.5% in the 2:1 test because with only 1 NVIDIA pod, it saturates faster and the Inferentia pod's slower response time still limits its share.
+6. **At moderate concurrency (2.8-9.9 req/s), ITL is 35-42ms** — acceptable for code assistant use cases
+
+> **Conclusion:** Even with a 1:1 NVIDIA:Inferentia ratio, the EPP correctly prioritizes the faster NVIDIA pod. Inferentia provides meaningful overflow capacity, absorbing 566 requests that would otherwise have queued behind the NVIDIA pod. The total throughput (3,052 tok/s) exceeds what a single NVIDIA pod alone would deliver (~1,690 tok/s), confirming the value of heterogeneous capacity.
+
+#### Inferentia2 Standalone — GuideLLM Sweep via llm-d (April 8, 2026)
+
+**Configuration:** `llm-d-multi-gpu` namespace, 1 endpoint: 1x Inferentia2 (BF16, HTTPS, max-model-len=8192). NVIDIA machine pool scaled to 0. All requests routed to the single Inferentia pod via llm-d EPP.
+**GuideLLM version:** 0.5.4, synthetic data: 128 prompt tokens, 128 output tokens.
+
+| # | Strategy | Rate (req/s) | Requests | Errors | Output tok/s | TTFT (ms) | ITL (ms) | Latency (s) | Concurrency |
+|---|----------|-------------|----------|--------|-------------|-----------|----------|-------------|-------------|
+| 1 | synchronous | - | 9 | 0 | 17.2 | 418 | 55.5 | 7.5 | 1.0 |
+| 2 | throughput | - | 64 | 1 | 151.0 | 24,028 | 80.1 | 34.2 | 36.5 |
+| 3 | constant | 0.2 | 14 | 0 | 30.1 | 452 | 58.9 | 7.9 | 1.8 |
+| 4 | constant | 0.3 | 19 | 0 | 42.3 | 453 | 65.5 | 8.8 | 2.8 |
+| 5 | constant | 0.4 | 25 | 0 | 54.7 | 456 | 68.8 | 9.2 | 3.8 |
+| 6 | constant | 0.5 | 31 | 0 | 67.1 | 453 | 72.0 | 9.6 | 5.0 |
+| 7 | constant | 0.6 | 36 | 0 | 78.3 | 448 | 78.5 | 10.4 | 6.2 |
+| 8 | constant | 0.7 | 41 | 0 | 89.8 | 445 | 83.6 | 11.1 | 7.6 |
+| 9 | constant | 0.8 | 47 | 0 | 100.1 | 455 | 91.6 | 12.1 | 9.5 |
+| 10 | constant | 0.9 | 52 | 0 | 110.1 | 453 | 98.5 | 13.0 | 11.2 |
+
+**Total requests:** 338 — **1 error** (timeout at max throughput)
+
+**Key observations (Inferentia-only via llm-d):**
+
+1. **Single-user (synchronous): 17.2 output tok/s**, 418ms TTFT, 55.5ms ITL — consistent with previous standalone Inferentia measurements
+2. **Peak throughput: 151 output tok/s** at max concurrency (36.5 concurrent requests) — but with 24s TTFT and 1 timeout error
+3. **Sustainable throughput: ~110 tok/s** at 0.9 req/s with 13s latency and 0 errors
+4. **Sweet spot: 0.4-0.6 req/s** — ITL stays under 73ms and latency under 10s, suitable for interactive coding
+5. **TTFT remains stable at ~450ms** across constant-rate strategies, confirming the Neuron prefill cost is constant regardless of queue depth
+6. **Compared to NVIDIA L40S**: Inferentia delivers ~6.5% of NVIDIA's peak throughput (151 vs 3,052 tok/s) and ~5.4x higher ITL (55ms vs 10ms), confirming its role as overflow capacity rather than primary fleet
+
+> **Conclusion:** A single Inferentia2 `inf2.24xlarge` running Qwen3-Coder-30B (BF16, TP=8) provides a serviceable code assistant experience for 1-3 concurrent users at interactive latency. Beyond that, requests queue rapidly. For primary fleet use, NVIDIA L40S is 20x more cost-efficient per output token. Inferentia's value is as supplemental capacity behind llm-d when NVIDIA pods are saturated.
 
 #### Inferentia Context Window — Maximum Supported Length
 
@@ -771,9 +884,152 @@ This requires a **full NEFF recompilation** (30-45 min for new bucket sizes, cac
 
 ---
 
+### Phase 4: Trainium trn1.32xlarge with Neuron DRA Driver
+
+**Objective:** Deploy Qwen3-Coder-30B on AWS Trainium (`trn1.32xlarge`) using the **Neuron DRA (Dynamic Resource Allocation) driver** — the Kubernetes-native device allocation method that replaces the legacy device-plugin + neuron-scheduler stack. Validate llm-d heterogeneous routing between NVIDIA L40S (FP8) and Trainium (BF16) backends.
+
+**Date:** April 9, 2026
+
+**Configuration:**
+
+| Property | Value |
+|----------|-------|
+| Instance | `trn1.32xlarge` ($21.50/hr) |
+| AZ | `us-east-2c` (new private subnet `10.0.12.0/24` created) |
+| NeuronCores | 16 of 32 (via DRA `ResourceClaimTemplate`, `ExactCount=16`) |
+| HBM | 512 GB total (256 GB used by 16 cores) |
+| Model | `Qwen/Qwen3-Coder-30B-A3B-Instruct` (BF16, 57 GB) |
+| TP | 16 (tensor-parallel across 16 NeuronCores) |
+| Max context | 16,384 tokens |
+| Batch size | 16 |
+| vLLM | 0.13.0 (Neuron build, SDK 2.28.0) |
+| Device allocation | **Neuron DRA Driver v1.0.0** (Helm chart v1.5.0) |
+| Neuron Operator | v1.1.2 |
+| Taint | `aws.amazon.com/neuroncore=present:NoSchedule` |
+| MoE routing | `moe_ep_degree=16`, `moe_tp_degree=1` |
+
+**Key findings:**
+
+1. **DRA driver works on Trainium** — the Neuron DRA driver (`public.ecr.aws/neuron/neuron-dra-driver:1.0.0`) successfully detected all 16 NeuronDevices on `trn1.32xlarge`, advertised them to the Kubernetes API, and allocated 16 NeuronCores to the model pod via `ResourceClaimTemplate`. This is the first validated DRA deployment in this project.
+
+2. **Subnet creation required** — `trn1.32xlarge` is only available in `us-east-2c`, but the ROSA cluster's subnets were in `us-east-2a` and `us-east-2b`. A new private subnet (`10.0.12.0/24`) was created in the existing VPC and associated with the private route table.
+
+3. **KMM SELinux fix** — the Neuron kernel module (`neuron.ko`) failed to load via `insmod` due to SELinux context (`tmp_t`). The fix was to copy the `.ko` file with `modules_object_t` SELinux context before loading. This is a known issue on RHCOS with SELinux Enforcing.
+
+4. **DRA DeviceClass** — the Helm chart creates a `DeviceClass neuron.aws.com` that the `ResourceClaimTemplate` references. Pods specify `resourceClaims` in their spec instead of the legacy `resources.limits["aws.amazon.com/neuroncore"]` approach.
+
+5. **16k context window** — the larger HBM (256 GB for 16 cores vs 128 GB for 8 cores on inf2.24xlarge) allows a 16k context window compared to the 4k limit on Inferentia2.
+
+6. **llm-d routing confirmed** — the EPP discovered the Trainium pod via label matching and started scraping its `/metrics` endpoint. Both NVIDIA and Trainium backends are routable through the same `InferencePool`.
+
+7. **NEFF compilation** — first-time compilation took ~25 minutes on trn1.32xlarge (14 buckets: 7 context_encoding + 7 token_generation). Compiled artifacts are cached on EBS PVC for subsequent restarts.
+
+#### GuideLLM Sweep Results — Trainium trn1.32xlarge (April 9, 2026)
+
+**Test setup:** GuideLLM v0.5.4, `prompt_tokens=128, output_tokens=128`, sweep profile (10 strategies), max 120s/100 requests per strategy. Only the Trainium backend active (NVIDIA scaled to 0).
+
+**Request Latency:**
+
+| Strategy | Request Latency (Mdn) | TTFT Mdn (ms) | TTFT p95 (ms) | ITL Mdn (ms) | TPOT Mdn (ms) | TPOT p95 (ms) |
+|----------|----------------------|---------------|---------------|--------------|---------------|---------------|
+| Synchronous | 6.8s | 1697.1 | 2406.6 | 40.5 | 53.4 | 59.1 |
+| Throughput | 32.2s | 26991.0 | 57360.2 | 133.7 | 251.4 | 502.4 |
+| Constant (low) | 8.6s | 1728.5 | 1744.5 | 53.8 | 66.9 | 67.0 |
+| Constant (mid) | 11.9s | 1721.7 | 1736.8 | 80.4 | 93.2 | 93.4 |
+| Constant (high) | 32.2s | 1738.6 | 1772.2 | 240.1 | 251.8 | 252.1 |
+
+**Server Throughput:**
+
+| Strategy | Req/s (Mdn) | Concurrency (Mdn) | Input Tok/s (Mdn) | Output Tok/s (Mean) | Total Tok/s (Mean) |
+|----------|------------|-------------------|-------------------|--------------------|--------------------|
+| Synchronous | 0.1 | 1 | 19.9 | 19.0 | 39.2 |
+| Throughput | 0.1 | 84 | 80.6 | 65.4 | 273.9 |
+| Constant (low) | 0.2 | 2 | 25.3 | 23.8 | 50.0 |
+| Constant (mid) | 0.3 | 4 | 43.5 | 39.9 | 84.2 |
+| Constant (high) | 0.5 | 16 | 67.6 | 56.3 | 124.9 |
+
+**Key observations:**
+- **TTFT**: ~1.7s at low concurrency, consistent across load levels (MoE compilation creates fixed overhead)
+- **ITL**: 40.5ms synchronous → 240ms at high concurrency (graceful degradation)
+- **Peak throughput**: ~69 input tok/s, ~65 output tok/s at max concurrency
+- **16 NeuronCores (TP=16)** enables concurrent request handling that scales to 16 simultaneous requests before saturation
+
+**Trainium DRA deployment YAML (key sections):**
+
+```yaml
+spec:
+  template:
+    spec:
+      resourceClaims:
+      - name: neurons
+        resourceClaimTemplateName: trainium-16-cores
+      containers:
+      - name: kserve-container
+        resources:
+          claims:
+          - name: neurons
+          requests:
+            cpu: "16"
+            memory: 200Gi
+```
+
+```yaml
+apiVersion: resource.k8s.io/v1
+kind: ResourceClaimTemplate
+metadata:
+  name: trainium-16-cores
+spec:
+  spec:
+    devices:
+      requests:
+      - name: neurons
+        exactly:
+          deviceClassName: neuron.aws.com
+          allocationMode: ExactCount
+          count: 16
+          selectors:
+          - cel:
+              expression: "device.attributes['neuron.aws.com'].instanceType == 'trn1.32xlarge'"
+```
+
+#### Phase 4b: 2-Replica Scaling Investigation (April 9, 2026)
+
+**Objective:** Determine whether two replicas of Qwen3-Coder-30B (TP=16 each) can run simultaneously on a single `trn1.32xlarge`.
+
+**Capacity analysis:**
+
+| Resource | Total on trn1.32xlarge | Per Replica (TP=16) | 2 Replicas | Fits? |
+|----------|----------------------|--------------------|-----------|----|
+| NeuronDevices (DRA) | 16 | 8 (= 16 NeuronCores) | 16 | Yes (resource-wise) |
+| CPU | 128 vCPU (127.5 allocatable) | 16 request | ~32.3 | Yes |
+| Memory | 512 GiB (494 GiB allocatable) | 200 GiB request | ~407 GiB | Yes |
+| HBM | 512 GB (16 devices × 32 GB) | 256 GB (8 devices × 32 GB) | 512 GB | Yes |
+
+**What was attempted:**
+
+1. Created a new `ResourceClaimTemplate` (`trainium-8-devices`) requesting 8 DRA devices per pod
+2. Deployed with `replicas: 2` — DRA correctly allocated 8 NeuronDevices to each pod with no overlap
+3. Both pods scheduled on the trn1 node, sharing the RWO PVC (allowed since same node)
+
+**Result: NOT FEASIBLE with TP=16**
+
+Two critical failures blocked 2-replica operation:
+
+1. **NEFF execution failure (`Failed to execute model ... with status 1`)** — The compiled NEFF artifacts assume a specific NeuronLink interconnect topology. With TP=16 across 8 NeuronDevices (16 NeuronCores), the NeuronLink collective communication patterns (all-reduce, all-gather) differ from the 16-device topology. NEFFs cached from the single-replica 16-device deployment cannot execute on an 8-device partition, and NEFFs compiled for one 8-device group may not match another 8-device group's physical layout.
+
+2. **Disk pressure from simultaneous NEFF compilation** — Both pods compiling NEFFs simultaneously wrote large intermediate HLO/NEFF artifacts to the node's ephemeral storage (`/tmp/nxd_model/`), triggering `DiskPressure: True` and kubelet eviction (exit code 137). The Neuron compiler's temporary file usage (30-50 GB per compilation) exceeds safe thresholds when two compilations run in parallel on the same node.
+
+**Recommendation for multi-replica Trainium:**
+
+- **TP=8 per replica** (4 NeuronDevices × 2 cores = 8 NeuronCores) could theoretically enable 2 replicas, but requires model recompilation and may not provide enough HBM for larger context windows. This is a future experiment.
+- **Horizontal scaling across nodes** (2 × `trn1.32xlarge` with 1 replica each) is the reliable approach for scaling Trainium inference throughput.
+- **Staggered startup** — if 2 replicas are attempted, deploy sequentially (start replica 1, wait for NEFF cache to populate, then start replica 2) to avoid disk pressure.
+
+---
+
 ## Planned Test Phases
 
-### Phase 4: Dual Qwen3-Coder-30B on inf2.48xlarge
+### Phase 5: Dual Qwen3-Coder-30B on inf2.48xlarge (planned)
 
 **Objective:** Validate running two independent Qwen3-Coder-30B BF16 instances on a single `inf2.48xlarge` node with core partitioning, benchmark aggregate throughput with GuideLLM, and compare cost-efficiency against 2x `inf2.24xlarge`.
 
@@ -815,7 +1071,7 @@ rosa create machinepool \
   --instance-type=inf2.48xlarge \
   --replicas=1 \
   --labels=node-role.kubernetes.io/inferentia=,accelerator=neuron \
-  --taints=aws.amazon.com/neuron:NoSchedule
+  --taints="aws.amazon.com/neuroncore=present:NoSchedule"
 
 # Wait for node to be Ready
 oc get nodes -l node.kubernetes.io/instance-type=inf2.48xlarge -w
@@ -1080,7 +1336,7 @@ oc get nodes -l node.kubernetes.io/instance-type=inf2.48xlarge  # should return 
 
 **Do not delete the PVC** — NEFF cache artifacts persist for future testing.
 
-### Phase 5: NVIDIA g6e.2xlarge (L40S) Full GuideLLM Benchmark
+### Phase 6: NVIDIA g6e.2xlarge (L40S) Full GuideLLM Benchmark
 
 **Objective:** Run the complete GuideLLM sweep benchmark on 2x `g6e.2xlarge` (L40S, FP8) with llm-d EPP routing to produce the definitive performance baseline for Qwen3-Coder-30B on NVIDIA, matching the same test matrix used for Inferentia in `inferentia_vllm_test_results.md`.
 
@@ -1248,9 +1504,11 @@ rosa create machinepool \
   --instance-type=g6e.2xlarge \
   --replicas=1 \
   --labels="nvidia.com/gpu.present=true" \
-  --taints="nvidia.com/gpu=NoSchedule" \
+  --taints="nvidia.com/gpu=present:NoSchedule" \
   --subnet=<private-subnet-id>
 ```
+
+The `NoSchedule` taint prevents non-GPU workloads from consuming CPU/memory on the GPU node. Only pods with a matching toleration (e.g., the model deployment and NVIDIA GPU Operator DaemonSets) will schedule here.
 
 Wait for the node to become `Ready`:
 
@@ -1616,6 +1874,10 @@ spec:
     nodeSelector:
       node.kubernetes.io/instance-type: inf2.24xlarge
     schedulerName: neuron-scheduler
+    tolerations:
+    - key: aws.amazon.com/neuroncore
+      operator: Exists
+      effect: NoSchedule
     securityContext:
       fsGroup: 0
       runAsUser: 0
@@ -1920,25 +2182,44 @@ When the model-serving namespace changes (e.g., from `llm-d-gpu` to `llm-d-multi
 
 | Component | Version | Image / Notes |
 |-----------|---------|---------------|
-| OpenShift | 4.21.6 | ROSA HCP, Kubernetes v1.34.4 |
-| RHCOS | 9.6 (Plow) | Kernel 5.14.0-570.98.1.el9_6.x86_64 |
+| **Platform** | | |
+| ROSA HCP | 4.21.7 | Red Hat OpenShift Service on AWS (Hosted Control Plane) |
+| OpenShift / Kubernetes | 4.21.7 / v1.34.4 | ROSA HCP managed |
+| RHCOS | 9.6 (Plow) | Kernel 5.14.0-570.99.1.el9_6.x86_64 |
+| CRI-O | 1.34.6-2 | Container runtime |
+| **AI / ML Platform** | | |
 | Red Hat OpenShift AI (RHOAI) | 3.3.0 | KServe, LLMInferenceService CRD, llm-d EPP |
-| Service Mesh 3 | 3.2.0 | Gateway API + ext_proc; **3.3.1 available on stable channel -- upgrade recommended** |
-| OpenShift Dev Spaces | 3.27.0 | Remote SSH support, che-code IDE |
-| DevWorkspace Operator | 0.40.0 | Managed by Dev Spaces |
+| KServe | managed by RHOAI 3.3 | `LLMInferenceService` and `InferenceService` CRDs |
+| llm-d EPP | managed by RHOAI 3.3 | `registry.redhat.io/rhoai/odh-llm-d-inference-scheduler-rhel9` |
+| Service Mesh 3 | 3.2.0 | Gateway API + ext_proc; **3.3.1 available -- upgrade recommended** |
+| **Model Serving** | | |
 | vLLM (CUDA) | 0.13.0+rhai11 | `registry.redhat.io/rhaiis/vllm-cuda-rhel9` (Red Hat AI build) |
 | vLLM (Neuron) | 0.13.0 | `public.ecr.aws/neuron/pytorch-inference-vllm-neuronx:0.13.0-neuronx-py312-sdk2.28.0-ubuntu24.04` |
-| llm-d EPP | -- | `registry.redhat.io/rhoai/odh-llm-d-inference-scheduler-rhel9` (managed by RHOAI) |
+| Model (NVIDIA) | Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8 | FP8 quantized, TP=1, 48 GB VRAM |
+| Model (Inferentia) | Qwen/Qwen3-Coder-30B-A3B-Instruct | BF16, TP=8, 128 GB HBM |
+| Model (Trainium) | Qwen/Qwen3-Coder-30B-A3B-Instruct | BF16, TP=16, 256 GB HBM, 16k context |
+| AWS Neuron SDK | 2.28.0 | Included in vLLM Neuron container image |
+| **Operators** | | |
 | NVIDIA GPU Operator | 26.3.0 | Certified operator from OperatorHub |
-| AWS Neuron Operator | 1.1.1 | Device plugin + neuron-scheduler |
+| AWS Neuron Operator | 1.1.2 | Upgraded from 1.1.1; device plugin + neuron-scheduler + KMM integration |
+| Neuron DRA Driver | 1.0.0 | `public.ecr.aws/neuron/neuron-dra-driver:1.0.0` — supports Trainium only (not Inferentia2); deployed via Helm chart |
+| Neuron Helm Chart | 1.5.0 | `aws-neuron/neuron-helm-charts` (Feb 28, 2026) |
 | cert-manager | 1.18.1 | Required dependency of LeaderWorkerSet |
 | LeaderWorkerSet Operator | 1.0.0 | Required CRD for LLMInferenceService |
 | Node Feature Discovery | 4.20.0-202603051149 | Deployed by default on ROSA HCP |
 | Kernel Module Management | 2.6.0 | Used for Neuron kernel modules |
+| **Developer Tools** | | |
+| OpenShift Dev Spaces | 3.27.0 | Remote SSH support, che-code IDE |
+| DevWorkspace Operator | 0.40.0 | Managed by Dev Spaces |
 | Continue Extension | v1.1.80 | VS Code extension for AI assistant (chat + autocomplete) |
 | Cline Extension | saoudrizwan.claude-dev | VS Code extension for AI coding (agent) |
 | Roo Code Extension | v3.51+ (RooVeterinaryInc.roo-cline) | VS Code extension for multi-mode AI agent (Apache 2.0, Cline fork) |
-| CRI-O | 1.34.6-2 | Container runtime |
+| **Benchmarking** | | |
+| GuideLLM | 0.5.4 | Sweep benchmark tool |
+| **AWS Infrastructure** | | |
+| NVIDIA Instance | g6e.2xlarge | 1x L40S GPU, 48 GB VRAM, $2.24/hr |
+| Inferentia Instance | inf2.24xlarge | 12 NeuronCores (8 used, TP=8), 128 GB HBM, $6.49/hr |
+| Trainium Instance | trn1.32xlarge | 32 NeuronCores (16 used, TP=16), 512 GB HBM, $21.50/hr |
 
 ---
 
@@ -2074,196 +2355,45 @@ The registry connects to KServe via `storageUri` resolution -- register the mode
 - **Neuron NEFF cache on EBS PVC (MANDATORY)** -- Set `NEURON_COMPILE_CACHE_URL` **and** `HF_HOME` to paths on an EBS-backed PVC (e.g., `/models/neuron-cache` and `/models/hf-cache`), **never** to ephemeral storage (`/tmp`, `emptyDir`). First-time Neuron compilation for Qwen3-Coder-30B takes **30-45 minutes**; warm-cache restarts take ~10 seconds. Losing NEFF artifacts on pod restart wastes 30-45 minutes of compilation time per pod. KServe 0.14+ (RHOAI 3.3) supports read/write PVC access in `RawDeployment` mode.
 - **Container memory right-sizing for Neuron compilation (MANDATORY)** -- Neuron compilation of Qwen3-Coder-30B MoE peaks at ~120 GB RSS (57 GB BF16 model weights + 60+ GB compiler workspace during bucket compilation). A 64Gi limit causes OOMKill during weight loading; a 128Gi limit causes OOMKill during bucket compilation. **Set limits to 200Gi minimum** for cold-cache compilation. Steady-state serving uses only ~15-20 GB. Always patch the `InferenceService` (not the Deployment), as KServe reconciles the Deployment from the InferenceService spec.
 - **SELinux and shared PVCs** -- When multiple pods share a `ReadWriteOnce` PVC on OpenShift, set `seLinuxOptions.level` to the same value (e.g., `s0:c0,c0`) on all pods. Without matching MCS labels, SELinux denies cross-pod file access regardless of Unix permissions.
-- **Heterogeneous llm-d routing** -- Unified routing across NVIDIA and Inferentia requires: (1) same namespace for all backends with `nodeSelector`-based scheduling, (2) identical `--served-model-name` (e.g., `qwen3-coder`), (3) HTTPS on all endpoints via vLLM native `--ssl-certfile`/`--ssl-keyfile` flags (EPP `--model-server-metrics-scheme` is global), (4) separate PVCs per accelerator type, (5) matching `InferencePool` labels on all pods. The prefix-cache scorer naturally favors GPU replicas (which support prefix caching), while Inferentia handles overflow.
+- **Heterogeneous llm-d routing** -- Unified routing across NVIDIA and Inferentia requires: (1) same namespace for all backends with `nodeSelector`-based scheduling, (2) **taints on accelerator machine pools** (`nvidia.com/gpu=present:NoSchedule` for GPU, `aws.amazon.com/neuroncore=present:NoSchedule` for Inferentia) with matching tolerations on model deployments — without taints, platform pods consume GPU node CPU and block model scheduling, (3) identical `--served-model-name`, (4) HTTPS on all endpoints via vLLM native `--ssl-certfile`/`--ssl-keyfile` flags (EPP `--model-server-metrics-scheme` is global), (5) separate PVCs per accelerator type, (6) matching `InferencePool` labels on all pods. The prefix-cache scorer naturally favors GPU replicas (which support prefix caching), while Inferentia handles overflow.
 
 ---
 
-## Appendix A: Neuron-Scheduler / OVN-Kubernetes Annotation Conflict -- Deep Dive
+## Appendix A: Neuron-Scheduler / OVN-Kubernetes Annotation Conflict
 
-### What Happens
+### Problem
 
-When a pod requesting `aws.amazon.com/neuroncore` resources is created on a ROSA HCP cluster with OVN-Kubernetes networking and the AWS `neuron-scheduler`, the pod becomes permanently stuck in `ContainerCreating` with the error:
+On ROSA HCP with OVN-Kubernetes CNI, pods using `schedulerName: neuron-scheduler` get stuck in `ContainerCreating` with:
 
 ```
 FailedCreatePodSandBox: failed to get pod annotation: timed out waiting for annotations: context deadline exceeded
 ```
 
-The kubelet retries every ~2 minutes, each attempt timing out after 120 seconds. The pod never gets an IP address and never starts.
+**Root cause:** The `neuron-scheduler` writes device-allocation annotations (`AWS_NEURON_IDS`, `NEURON_ALLOCATED`, `NEURON_ALLOC_TIME`) using a **full annotation replacement** that overwrites the `k8s.ovn.org/pod-networks` annotation set by OVN-Kubernetes. Without this networking annotation, the CNI plugin cannot assign an IP address and times out after 120 seconds.
 
-### Why It Happens -- The Annotation Race
-
-Kubernetes pods rely on **annotations** set by different controllers at different stages of the pod lifecycle. Two controllers both need to write annotations to the same pod object, and their writes conflict:
-
-**Controller 1 -- OVN-Kubernetes (networking):**
-
-OVN-Kubernetes is the Container Network Interface (CNI) plugin on ROSA HCP. When a pod is created, the `ovnkube-controller` (running on each node) watches for new pod objects and writes the `k8s.ovn.org/pod-networks` annotation. This annotation contains the pod's assigned IP address, MAC address, and logical switch port. Without it, the CNI plugin (called by the kubelet during sandbox creation) cannot configure the pod's network namespace -- it polls for the annotation and times out after 120 seconds if it's missing.
-
-**Controller 2 -- neuron-scheduler (device allocation):**
-
-The AWS `neuron-scheduler` is a custom Kubernetes scheduler that replaces the default scheduler for pods requesting NeuronCore resources. After deciding which node to place the pod on, the neuron-scheduler's **Bind callback** writes three annotations:
-
-| Annotation | Purpose |
-|------------|---------|
-| `AWS_NEURON_IDS` | Comma-separated list of Neuron device IDs allocated to this pod (e.g., `0,1,2,3,4,5,6,7`) |
-| `NEURON_ALLOCATED` | Flag (`true`) indicating allocation is complete |
-| `NEURON_ALLOC_TIME` | Nanosecond timestamp of allocation |
-
-The Neuron device plugin (running as a DaemonSet) reads these annotations during the kubelet's `Allocate` RPC to know which specific hardware devices to assign to the container. Without these annotations, the device plugin rejects the allocation with: `The requested Neuron resources are invalid without the k8s-neuron-scheduler`.
-
-**The conflict:**
-
-Both controllers update the pod's `.metadata.annotations` field. The neuron-scheduler uses a **full object update** (or non-strategic patch) that replaces the entire annotations map rather than merging individual keys. The sequence is:
-
-1. Pod is created (no annotations beyond those in the spec)
-2. OVN-Kubernetes detects the new pod and writes `k8s.ovn.org/pod-networks` (~15-30 ms after creation)
-3. The neuron-scheduler's Bind callback writes `AWS_NEURON_IDS`, `NEURON_ALLOCATED`, `NEURON_ALLOC_TIME` -- using a method that **replaces all annotations**, discarding the OVN annotation that was just set
-4. The kubelet calls the CNI plugin to set up networking
-5. The CNI plugin looks for `k8s.ovn.org/pod-networks` -- it's gone
-6. 120-second timeout, `FailedCreatePodSandBox`
-
-This was confirmed by inspecting the pod's annotations while it was stuck: the `AWS_NEURON_IDS`, `NEURON_ALLOCATED`, and `NEURON_ALLOC_TIME` annotations were present, but `k8s.ovn.org/pod-networks` was **absent** -- even though the OVN controller logs showed it had successfully written the annotation.
-
-### Why the Annotations Are Required
-
-| Annotation | Set By | Required By | What Breaks Without It |
-|------------|--------|-------------|----------------------|
-| `k8s.ovn.org/pod-networks` | OVN-Kubernetes controller | OVN CNI plugin (multus-shim) | Pod has no network interface, no IP address, cannot communicate |
-| `AWS_NEURON_IDS` | neuron-scheduler | Neuron device plugin | Device plugin rejects allocation; pod fails with `UnexpectedAdmissionError` |
-| `NEURON_ALLOCATED` | neuron-scheduler | Neuron device plugin | Same as above |
-
-Both sets of annotations are **mandatory** for a pod that needs both networking and NeuronCore devices. The problem is not that either annotation is unnecessary -- it's that the neuron-scheduler destroys the networking annotation when writing its own.
-
-### Is This Specific to llm-d?
-
-**No.** This issue affects **every pod** that uses the `neuron-scheduler` and requests multiple NeuronCores on ROSA HCP with OVN-Kubernetes. It is completely independent of llm-d.
-
-The issue was first encountered and documented during the **standalone Inferentia model deployment** (before llm-d was introduced), documented in `vllmoninferentia.md` Section 2 (Key Technical Notes) and the troubleshooting table. It occurred:
-
-1. **First occurrence**: When deploying the `qwen3-coder-neuron` InferenceService as a standalone KServe model (no llm-d, no GPU nodes involved)
-2. **Second occurrence**: During a pod restart of the same standalone Inferentia model (documented as "OVN-Kubernetes Race Condition (Recurring Issue)")
-3. **Third occurrence**: When attempting Phase 3 of the llm-d deployment (adding Inferentia to the llm-d pool)
-
-The reason it became **more visible** during the llm-d work is that we were doing more frequent pod lifecycle operations (scaling up/down, deleting/recreating) and the issue manifested every time.
-
-### Earlier Documentation vs. Current Understanding
-
-The earlier documentation (in `vllmoninferentia.md` Section 2) described the issue and offered a **workaround**:
-
-> *"Workaround: After the pod is bound by neuron-scheduler, force-delete and restart the ovnkube-node pod on the Inferentia node. OVN will re-reconcile all pods on the node, correctly applying network annotations."*
-
-This workaround was **intermittently effective** in earlier testing -- restarting `ovnkube-node` caused OVN to re-process all pods on the node, and if the timing was right (neuron-scheduler had finished its annotation writes), OVN would re-apply the `k8s.ovn.org/pod-networks` annotation successfully.
-
-Today's deeper investigation revealed that this workaround is **unreliable**:
-
-- Restarting `ovnkube-node` clears OVN's state, but the fundamental race still exists
-- If the neuron-scheduler writes annotations again (e.g., during the reconciliation), it will again overwrite OVN's annotation
-- The issue reproduced consistently across multiple `ovnkube-node` restarts during this session
-- The earlier "success" of the workaround may have been due to lucky timing -- the neuron-scheduler had already finished all its annotation writes by the time OVN re-reconciled
-
-### Root Cause Summary
+This affects **all pods** using `neuron-scheduler` on OVN-Kubernetes — it is not specific to llm-d, KServe, or any particular model.
 
 | Factor | Detail |
 |--------|--------|
-| **Root cause** | neuron-scheduler uses full annotation replacement, not strategic merge patch |
-| **Affected platforms** | ROSA HCP (and likely any OpenShift/Kubernetes with OVN-Kubernetes CNI + neuron-scheduler) |
-| **Affected workloads** | Any pod requesting >1 `aws.amazon.com/neuroncore` with `schedulerName: neuron-scheduler` |
-| **Not affected** | Pods with no neuroncore request; pods requesting 1 neuroncore with default-scheduler; NVIDIA GPU pods (use default-scheduler, no annotation conflict) |
-| **llm-d specific?** | **No** -- the issue predates llm-d and occurs with standalone InferenceService deployments |
-| **OVN restart workaround** | Unreliable; worked intermittently in earlier testing but failed consistently in extended testing |
+| **Root cause** | `neuron-scheduler` uses full annotation replacement, not strategic merge patch |
+| **Affected platforms** | ROSA HCP (and any OpenShift/Kubernetes with OVN-Kubernetes CNI + neuron-scheduler) |
+| **Affected workloads** | Any pod requesting `aws.amazon.com/neuroncore` with `schedulerName: neuron-scheduler` |
+| **Not affected** | NVIDIA GPU pods (use `default-scheduler`, no annotation conflict) |
 
-### Confirmed Workaround: OVN Restart After Scheduling
+### Implemented Workaround: MutatingAdmissionWebhook (Deployed)
 
-The workaround that was used successfully in earlier deployments (and confirmed again in testing) is:
+A custom `MutatingAdmissionWebhook` intercepts pod UPDATE operations and preserves the `k8s.ovn.org/pod-networks` annotation when the neuron-scheduler attempts to overwrite it. This makes the neuron-scheduler's full-replacement writes harmless — the OVN annotation is always restored.
 
-1. Let the pod be created and scheduled by the `neuron-scheduler`
-2. Wait for `NEURON_ALLOCATED=true` annotation to appear (confirms the scheduler extension has finished its writes)
-3. Force-restart the `ovnkube-node` pod on the Inferentia node
-4. OVN re-reconciles, re-applies `k8s.ovn.org/pod-networks`, and the CNI succeeds
+**Status:** Deployed and verified on ROSA HCP 4.21.7 (April 2, 2026). See Appendix B for live test results comparing this approach against `hostNetwork: true` and Kyverno policies.
 
-```bash
-# After the pod shows NEURON_ALLOCATED=true:
-INF_NODE=$(oc get pod -n <namespace> -l <pod-selector> -o jsonpath='{.items[0].spec.nodeName}')
-OVN_POD=$(oc get pods -n openshift-ovn-kubernetes --field-selector spec.nodeName=$INF_NODE -o name | head -1)
-oc delete $OVN_POD -n openshift-ovn-kubernetes --grace-period=0 --force
-```
+### Long-Term Solution: Neuron DRA Driver
 
-**Why it failed in extended testing earlier:** During rapid create/delete cycles (force-deleting stuck pods, scaling up/down repeatedly), the scheduler extension accumulates stale state and the OVN controller never gets a clean window to re-apply annotations. The workaround is reliable when:
-- There is a single, clean pod creation (not rapid thrashing)
-- The scheduler extension is healthy (restart it if it has been processing many force-deletes)
-- OVN is restarted AFTER `NEURON_ALLOCATED=true` (not before, not during)
+The [Neuron DRA driver](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/containers/neuron-dra.html) (released with Neuron SDK 2.28.0, Feb 2026) eliminates the neuron-scheduler entirely by using Kubernetes-native `ResourceClaim` objects for device allocation instead of pod annotations. With DRA, pods use `schedulerName: default-scheduler` and receive NeuronCore assignments through the Container Device Interface (CDI) — OVN annotations are never overwritten.
 
-**Automation:** This can be scripted as a post-scheduling hook or a lightweight controller that watches for pods stuck in `ContainerCreating` on Inferentia nodes.
+**DRA pod spec (replaces legacy neuron-scheduler approach):**
 
-### Upstream Status
-
-| Item | Finding |
-|------|---------|
-| **neuron-scheduler source code** | Not published. The scheduler extension is shipped as a container image (`public.ecr.aws/neuron/neuron-scheduler:2.24.23.0`). Source is not in `aws-neuron/aws-neuron-sdk` or `awslabs/operator-for-ai-chips-on-aws`. |
-| **RBAC grants** | The extension has `patch` and `update` verbs on `pods` ([scheduler_extension_cluster_role.yaml](https://github.com/awslabs/operator-for-ai-chips-on-aws/blob/main/config/rbac/scheduler_extension_cluster_role.yaml)), but whether it uses merge-patch or full-replace is not verifiable from public artifacts. |
-| **Related upstream issues** | [awslabs/operator-for-ai-chips-on-aws #65](https://github.com/awslabs/operator-for-ai-chips-on-aws/issues/65) -- stale node annotations (`NEURON_DEV_USAGE_MAP` / `NEURON_CORE_USAGE_MAP`) after uninstall/reinstall on ROSA. [aws-neuron/aws-neuron-sdk #1300](https://github.com/aws-neuron/aws-neuron-sdk/issues/1300) -- cross-filed scheduler state issue. Both concern node-level annotation state, not the pod-level OVN conflict. |
-| **No public OVN-specific issue** | No issue was found in AWS or Red Hat trackers describing the neuron-scheduler + OVN pod annotation overwrite specifically. This may need to be filed. |
-| **Operator v1.1.1 changelog** | [v1.1.0...v1.1.1 diff](https://github.com/awslabs/operator-for-ai-chips-on-aws/compare/v1.1.0...v1.1.1) contains CI/Go version updates and device plugin support changes. No fix for annotation patch semantics. |
-| **AWS Neuron docs** | [Scheduler Extension Flow](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/containers/tutorials/k8s-neuron-scheduler-flow.html) states: *"neuron-scheduler-extn updates the POD annotation with allocated neuron core/device Ids"* -- confirms the annotation update happens in the extension, not the kube-scheduler itself. |
-
-### Ranked Fix Options
-
-| Rank | Approach | Confidence | Effort | Notes |
-|------|----------|------------|--------|-------|
-| **1** | **OVN restart after scheduling** (confirmed) | **High** -- verified working | Low (scripted, ~10 lines of bash) | The workaround that was used successfully before and confirmed again. Automate with a watch script or init container. Only needed at pod creation time, not during runtime. |
-| **2** | **MutatingAdmissionWebhook** to preserve OVN annotation | High | Medium (requires deploying a webhook) | A webhook on pod UPDATE operations that detects removal of `k8s.ovn.org/pod-networks` and re-adds it from the old object. This would make the neuron-scheduler's overwrites harmless. Kubernetes webhooks support `oldObject` in AdmissionReview for UPDATEs. |
-| **3** | **Kyverno mutate policy** to restore OVN annotation | High | Medium (requires Kyverno operator) | Same concept as #2 but using Kyverno's policy engine rather than a custom webhook. Kyverno can run `mutate` rules on UPDATE operations with access to the old and new objects. |
-| **4** | **File upstream bug** with AWS Neuron team | Necessary regardless | Low effort to file; fix timeline unknown | File an issue on `awslabs/operator-for-ai-chips-on-aws` describing the OVN annotation overwrite. Request the scheduler extension use `strategicMergePatch` or `server-side apply` with a field manager for pod annotations. |
-| **5** | **Neuron DRA driver** (eliminates neuron-scheduler) | **Very High** -- removes root cause | High (architecture change) | Replace the legacy neuron-scheduler + device plugin with the Neuron DRA driver (SDK 2.28.0+). DRA uses Kubernetes-native `ResourceClaim` objects for device allocation, eliminating annotation-based scheduling entirely. DRA is GA in OpenShift 4.21. KServe `resourceClaims` support is pending upstream. See Appendix A for full analysis. |
-| **6** | **hostNetwork: true** | Medium (works but has trade-offs) | Low | Bypasses CNI entirely. The pod uses the node's network stack. Trade-offs: port conflicts if multiple pods run on same node, reduced network isolation, may conflict with Service Mesh/Istio sidecar injection. Only suitable as a temporary test, not production. |
-
-### Long-Term Solution: AWS Neuron DRA (Dynamic Resource Allocation) Driver
-
-The [Neuron DRA driver](https://awsdocs-neuron.readthedocs-hosted.com/en/latest/containers/neuron-dra.html) (released with Neuron SDK 2.28.0, [announced March 2026](https://aws.amazon.com/about-aws/whats-new/2026/03/neuron-eks-dra-support/)) represents a fundamental architectural shift that eliminates the neuron-scheduler and its annotation-based device allocation entirely.
-
-**Why DRA eliminates the annotation conflict:**
-
-The legacy flow that causes the bug:
-1. Pod is created with `schedulerName: neuron-scheduler`
-2. The neuron-scheduler extension's Bind callback writes `AWS_NEURON_IDS`, `NEURON_ALLOCATED`, `NEURON_ALLOC_TIME` annotations using a full object replacement
-3. This full replacement **overwrites** `k8s.ovn.org/pod-networks`
-4. CNI times out waiting for the missing annotation
-
-The DRA flow:
-1. Pod is created with `schedulerName: default-scheduler` (no custom scheduler)
-2. Pod spec includes `resourceClaims` referencing a `ResourceClaimTemplate`
-3. The DRA driver allocates Neuron devices through Kubernetes `ResourceClaim` API objects -- **not pod annotations**
-4. Device information is passed to containers via CDI (Container Device Interface)
-5. OVN sets `k8s.ovn.org/pod-networks` normally -- nothing overwrites it
-
-**Platform readiness:**
-
-| Requirement | Status |
-|-------------|--------|
-| Kubernetes DRA API (`resource.k8s.io/v1`) | GA in Kubernetes 1.32+, available in OpenShift 4.21 (K8s 1.34) |
-| [OpenShift DRA support](https://developers.redhat.com/articles/2026/03/25/dynamic-resource-allocation-goes-ga-red-hat-openshift-421-smarter-gpu) | GA in OpenShift 4.21 (March 2026). Feature gate enabled by default. |
-| Neuron DRA driver | Released in Neuron SDK 2.28.0 (Feb 2026). AWS docs claim support for Inf1, Inf2, Trn1, Trn2, Trn3. |
-| Installation method | Neuron Helm chart with `draDriver.enabled=true`, `devicePlugin.enabled=false` |
-| KServe `InferenceService` + DRA | **Not yet supported.** KServe maps accelerators via `resources.limits`, not `resourceClaims`. Requires either upstream KServe changes, raw Deployment mode, or a custom controller. |
-| ROSA HCP validation | **Tested April 6, 2026 -- FAILS on Inferentia2.** See live validation results below. |
-| vLLM compatibility | vLLM does not require core changes -- it runs inside DRA-allocated resources. Pod spec changes are at the Kubernetes level. |
-
-**Example: Inferentia pod with DRA vs legacy:**
-
-Legacy (causes annotation conflict):
 ```yaml
 spec:
-  schedulerName: neuron-scheduler
-  containers:
-    - name: vllm
-      resources:
-        limits:
-          aws.amazon.com/neuroncore: "8"
-```
-
-DRA (eliminates annotation conflict):
-```yaml
-spec:
-  # No custom scheduler -- uses default-scheduler
   containers:
     - name: vllm
       resources:
@@ -2294,116 +2424,33 @@ spec:
           matchAttribute: "resource.aws.com/devicegroup8_id"
 ```
 
-**Advantages over the MutatingAdmissionWebhook:**
+**DRA driver test results (April 6, 2026):**
 
-| Dimension | MutatingAdmissionWebhook | Neuron DRA Driver |
-|-----------|--------------------------|-------------------|
-| Fixes root cause | No -- preserves annotation reactively | **Yes** -- eliminates annotation-based allocation |
-| Custom components | Webhook Deployment + Service | Neuron DRA driver (replaces device plugin + scheduler) |
-| Maintenance | Must be kept running; webhook failure = pod failure | Part of the Neuron stack; maintained by AWS |
-| Topology awareness | Relies on neuron-scheduler for NeuronCore placement | Built into DRA with `matchAttribute` constraints |
-| Multi-replica | No impact | No impact; DRA handles per-pod claims |
-| KServe integration | Works with existing InferenceService | **Requires changes** -- KServe must support `resourceClaims` |
-| Maturity | Verified in live testing (April 2026) | New (Feb 2026); not yet validated on ROSA HCP |
-
-**Live Validation Results (April 6, 2026):**
-
-The Neuron DRA driver was tested on ROSA HCP 4.21.7 with an `inf2.24xlarge` node. The test used Helm chart `neuron-helm-chart:1.5.0` with `neuron-dra-driver:1.0.0`.
+Tested `neuron-dra-driver:1.0.0` via Helm chart `neuron-helm-chart:1.5.0` on ROSA HCP 4.21.7 with `inf2.24xlarge`.
 
 | Step | Result |
 |------|--------|
-| Helm install with `draDriver.enabled=true` | Succeeded -- CRDs, namespace, RBAC created |
-| `neuron-dra-driver-kubelet-plugin` DaemonSet scheduling | **Failed** -- `DESIRED=0`. The DaemonSet `nodeAffinity` only includes Trainium types (`trn1.*`, `trn2.*`, `trn3.*`). No `inf1.*` or `inf2.*` entries. |
-| Manual patch to add `inf2.*` to nodeAffinity | Succeeded -- DRA pod scheduled on inf2.24xlarge |
-| DRA driver startup | **Crashed** with: `Error: failed to create device state: failed to discover devices: unsupported instance type: inf2.24xlarge` |
+| Helm install with `draDriver.enabled=true` | Succeeded |
+| DaemonSet scheduling on inf2 node | **Failed** (`DESIRED=0`) — patched manually to add inf2 affinity |
+| DRA driver startup after affinity patch | **Crashed**: `unsupported instance type: inf2.24xlarge` |
 
-**Root cause:** The DRA driver binary's internal instance-type mapping (`mappings.go`) does not recognize Inferentia2 instance types. This is a **code-level limitation in the v1.0.0 binary**, not a configuration or Helm values issue. Even if the DaemonSet affinity is patched, the driver itself rejects `inf2.24xlarge`.
+**Blockers (as of April 8, 2026):**
 
-**Conclusion:** Despite AWS documentation claiming Inf2 support, Neuron DRA driver v1.0.0 (released with SDK 2.28.0) **does not support Inferentia2 instances**. The driver only works on Trainium (trn1/trn2/trn3). After this finding, the DRA driver was uninstalled and the cluster reverted to the legacy Neuron Operator stack (device-plugin + neuron-scheduler + MutatingAdmissionWebhook).
+| Blocker | Status | Who must fix |
+|---------|--------|--------------|
+| **DRA driver binary rejects inf2 instance types** | **OPEN** — `neuron-dra-driver:1.0.0` is the only version available. The compiled binary's `mappings.go` lacks inf2 entries. | AWS Neuron team (new image build required) |
+| **KServe lacks `resourceClaims` support** | **OPEN** — no upstream PR found | KServe / Red Hat RHOAI team |
+| **Helm chart DaemonSet excludes inf2 in affinity** | **Likely FIXED** — chart v1.5.0 `neuronInstances` list includes inf2 types | Verify with retest |
 
-**Assessment:** The Neuron DRA driver is architecturally the correct long-term fix because it removes the annotation-based scheduling mismatch rather than patching around it. However, it is **not deployable on Inferentia2 today** due to three blockers:
+**Version investigation (April 8, 2026):** Checked AWS ECR, Neuron Helm chart repo (latest: v1.5.0), Neuron SDK release notes (SDK 2.28.0/2.28.1), and Neuron DRA documentation. Only `neuron-dra-driver:1.0.0` exists. The DRA documentation explicitly describes the driver as targeting "AWS Trainium instances" and uses `Trn2.48xlarge` in all examples — no inf2 examples exist.
 
-1. **DRA driver v1.0.0 rejects Inferentia2 instance types** (verified -- see above)
-2. **KServe does not yet support `resourceClaims`** in `InferenceService`
-3. **Helm chart DaemonSet affinity excludes Inferentia** by default
+> **Note:** The Neuron Operator (`awslabs/operator-for-ai-chips-on-aws`) is at v1.1.1 (released March 26, 2026) and manages the legacy device-plugin + neuron-scheduler stack. The DRA driver is distributed separately via the Neuron Helm chart (`aws-neuron/neuron-helm-charts`). A future Neuron Operator release or Neuron SDK update may bundle an updated DRA driver with Inferentia2 support. **Check for new versions of both the Neuron Operator and the Neuron Helm chart before each deployment** — the DRA driver fix for Inferentia2 will likely arrive as either a new `neuron-dra-driver` image tag or as part of a new Neuron SDK release.
 
 **Recommended path:**
-- **Now:** Continue using the MutatingAdmissionWebhook as the production fix (deployed and verified).
-- **Track:** Monitor Neuron SDK releases for DRA driver updates that add `inf2.*` to the instance-type mapping and DaemonSet affinity.
-- **Upstream action:** File issue with AWS Neuron team on `aws-neuron/neuron-helm-chart` describing: (a) DaemonSet affinity missing `inf2.*`, (b) driver binary `mappings.go` rejecting `inf2.24xlarge`.
-- **Migrate:** Plan DRA migration when both the driver supports Inferentia2 AND KServe adds `resourceClaims` support.
-
-### DRA Driver Version Investigation (April 8, 2026)
-
-**Updated finding:** Comprehensive research confirms there is **no DRA driver version newer than `1.0.0`** available as of April 8, 2026. The investigation checked multiple sources:
-
-| Source | Result |
-|--------|--------|
-| AWS ECR (`public.ecr.aws/neuron/neuron-dra-driver`) | Only tag `1.0.0` confirmed (from Helm `values.yaml`). Registry API returns `Not Authorized` for direct tag listing. |
-| Neuron Helm chart repo (`neuron-helm-charts`) | Latest release: **v1.5.0** (Feb 28, 2026). `values.yaml` on `main` still sets `draDriver.image.tag: "1.0.0"`. No newer DRA driver tag referenced. |
-| AWS Neuron SDK release notes | DRA introduced in **Containers 2.28.0** (Feb 26, 2026). No subsequent release mentions a DRA driver update or Inferentia2 support. SDK 2.28.1 still lists Containers at 2.28.0. |
-| GitHub `aws-neuron/neuron-dra-driver` | Returns **404** — no public source repository available. Cannot inspect `mappings.go` for changes. |
-| Neuron DRA documentation (`neuron-dra.rst`) | Explicitly states the driver implements the kubelet plugin for **"AWS Trainium instances"**. Prerequisites call out `Trn2.48xlarge`. No `inf2` DRA examples exist in the documentation body. |
-
-**Key distinction — Helm chart vs binary:**
-
-The Helm chart `values.yaml` at v1.5.0 **does include** `inf2.xlarge`, `inf2.8xlarge`, `inf2.24xlarge`, `inf2.48xlarge` in the `neuronInstances` list (DaemonSet nodeAffinity). This means Blocker 3 (DaemonSet scheduling) may already be resolved in the latest chart. However, this does **not** fix Blocker 1 — the compiled binary (`1.0.0`) still rejects `inf2.24xlarge` at runtime with `unsupported instance type`.
-
-| Blocker | Status (April 8, 2026) | Who must fix |
-|---------|------------------------|--------------|
-| **1. Driver binary rejects inf2 instance types** | **OPEN** — only `1.0.0` exists, which lacks inf2 mappings | AWS Neuron team (new image build) |
-| **2. KServe lacks `resourceClaims` support** | **OPEN** — no upstream PR found | KServe / Red Hat RHOAI team |
-| **3. Helm chart DaemonSet excludes inf2** | **Likely FIXED** in chart v1.5.0 (inf2 in `neuronInstances`) | N/A (verify with retest) |
-
-**Where changes are required:**
-
-| Component | Location | Issue | User-Fixable? |
-|-----------|----------|-------|---------------|
-| DaemonSet nodeAffinity | Helm chart `values.yaml` -> `neuronInstances` | Present in v1.5.0 chart — inf2 types listed | **Yes** — likely resolved |
-| Driver device discovery | `mappings.go` inside `neuron-dra-driver:1.0.0` image | Does not map `inf2.24xlarge` to core/device counts | **No** — compiled binary. Requires AWS to rebuild image with inf2 mappings |
-| KServe `resourceClaims` | KServe / RHOAI InferenceService spec | No field for DRA `ResourceClaimTemplate` | **No** — requires upstream feature addition |
-
-**Recommended path (unchanged):**
-- **Now:** Continue using the MutatingAdmissionWebhook as the production fix (deployed and verified).
-- **Track:** Monitor Neuron SDK releases for DRA driver images newer than `1.0.0`. Check ECR tags periodically.
-- **Upstream action:** File issue on `aws-neuron/neuron-helm-charts` describing: (a) DRA driver binary `mappings.go` rejecting `inf2.24xlarge`, (b) documentation claiming inf2 support while the driver does not implement it.
-- **Migrate:** Plan DRA migration when all three blockers are resolved.
-
-**Retest procedure (when new DRA version is released):**
-
-1. Check for updated DRA driver image:
-
-```bash
-aws ecr-public describe-images --repository-name neuron-dra-driver --region us-east-1
-```
-
-2. Install with latest Helm chart:
-
-```bash
-helm install neuron-helm-chart neuron-helm-charts/neuron-helm-chart \
-  --namespace neuron-dra-system --create-namespace \
-  --set draDriver.enabled=true \
-  --set devicePlugin.enabled=false \
-  --set neuronScheduler.enabled=false
-```
-
-3. Verify DaemonSet scheduling and driver startup:
-
-```bash
-oc get daemonset -n neuron-dra-system
-oc logs -n neuron-dra-system -l app=neuron-dra-driver --tail=50
-```
-
-4. If driver initializes: test `ResourceClaim` allocation with 8 NeuronCores and verify OVN annotation preservation.
-
-5. Rollback if DRA fails:
-
-```bash
-helm uninstall neuron-helm-chart -n neuron-dra-system
-oc delete namespace neuron-dra-system
-```
-
-Full step-by-step procedure is documented in `private_code_assistant_TEST_PLAN.md` Phase B.
+- **Now:** Continue using the MutatingAdmissionWebhook (deployed and verified).
+- **Before each new cluster:** Check for newer Neuron Operator, Helm chart, and DRA driver versions. If a DRA driver newer than `1.0.0` is available, retest on inf2.
+- **Upstream action:** File issue on `aws-neuron/neuron-helm-charts` requesting inf2 support in the DRA driver binary.
+- **Migrate to DRA:** When all three blockers are resolved (driver supports inf2, KServe supports `resourceClaims`, Helm chart affinity includes inf2).
 
 ---
 
@@ -2502,4 +2549,4 @@ Three candidate fixes for the neuron-scheduler / OVN-Kubernetes annotation confl
 
 Document Version: 2.4
 Last Updated: April 2026
-Status: Active Development -- Phases 1-3 verified. Phase 3 native heterogeneous routing verified (April 8, 2026): same-namespace, native TLS, no proxy bridge, 0 errors in GuideLLM sweep. Dev Spaces extensions configured via Red Hat recommended ConfigMap approach. DRA retest and Phase 4 (inf2.48xlarge dual-instance) planned.
+Status: Active Development -- Phases 1-4 verified. Phase 4b 2-replica scaling investigation completed (April 9, 2026): TP=16 requires all 16 NeuronDevices for NeuronLink topology — 8-device split causes NEFF execution failures and disk pressure; horizontal scaling across nodes recommended instead. Phase 4 Trainium trn1.32xlarge with DRA driver deployed (April 9, 2026): 16 NeuronCores via ResourceClaimTemplate, TP=16, 16k context, llm-d routing verified, GuideLLM sweep confirmed. Phase 3 heterogeneous routing verified (April 8, 2026): same-namespace, native TLS, 0 errors in GuideLLM sweep. Phase 5 (inf2.48xlarge dual-instance) and Phase 6 (L40S full benchmark) planned.

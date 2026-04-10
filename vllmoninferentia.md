@@ -1,6 +1,6 @@
-# Deploying LLM Inference with vLLM on AWS Inferentia2 (ROSA / OpenShift)
+# Deploying LLM Inference with vLLM on AWS Inferentia2 and Trainium (ROSA / OpenShift)
 
-A step-by-step guide to running LLM inference using vLLM on AWS Inferentia2 nodes within a Red Hat OpenShift Service on AWS (ROSA) cluster, leveraging the AWS Neuron SDK, Neuron Operator, and OpenShift AI.
+A step-by-step guide to running LLM inference using vLLM on **AWS Inferentia2** and **AWS Trainium** nodes within a Red Hat OpenShift Service on AWS (ROSA) cluster, leveraging the AWS Neuron SDK, Neuron Operator, and OpenShift AI.
 
 ---
 
@@ -134,7 +134,7 @@ The following resource requirements were measured on a running ROSA HCP 4.21.6 c
 - **Neuron Scheduler + OVN Annotation Conflict**: On ROSA HCP with OVN-Kubernetes CNI, the `neuron-scheduler` causes `FailedCreatePodSandBox: timed out waiting for annotations` errors. The root cause is that the neuron-scheduler extension overwrites OVN's `k8s.ovn.org/pod-networks` annotation when writing `AWS_NEURON_IDS`, `NEURON_ALLOCATED`, and `NEURON_ALLOC_TIME`. Without the OVN annotation, the CNI plugin cannot configure pod networking. This affects every pod using the neuron-scheduler for multi-core allocation, regardless of workload type.
   - **Production fix (verified)**: Deploy a **MutatingAdmissionWebhook** that intercepts pod UPDATE operations and restores `k8s.ovn.org/pod-networks` when the neuron-scheduler overwrites it. Tested and confirmed working -- see [live test results in private_code_assistant.md](private_code_assistant.md#appendix-b-ovn-annotation-fix----live-test-results-april-2-2026). Alternative fixes (Kyverno, hostNetwork) were also tested: Kyverno was blocked by TLS init issues on OpenShift; hostNetwork bypassed CNI but caused port conflicts.
   - **Quick workaround**: Wait for `NEURON_ALLOCATED=true` annotation to appear on the pod, then force-restart the `ovnkube-node` pod on the Inferentia node. Reliable for single clean pod creation, but requires manual intervention each time.
-  - **Long-term solution**: The **AWS Neuron DRA (Dynamic Resource Allocation) driver** (Neuron SDK 2.28.0+, March 2026) eliminates the neuron-scheduler entirely. DRA uses Kubernetes-native `ResourceClaim` objects for device allocation instead of pod annotations, removing the root cause. DRA is GA in OpenShift 4.21 / Kubernetes 1.34. See the [deep-dive analysis in private_code_assistant.md](private_code_assistant.md#appendix-a-neuron-scheduler--ovn-kubernetes-annotation-conflict----deep-dive) for root cause details, upstream status, and all fix options including DRA.
+  - **Long-term solution**: The **AWS Neuron DRA (Dynamic Resource Allocation) driver** (Neuron SDK 2.28.0+, March 2026) would eliminate the neuron-scheduler entirely. DRA uses Kubernetes-native `ResourceClaim` objects for device allocation instead of pod annotations, removing the root cause. DRA is GA in OpenShift 4.21 / Kubernetes 1.34. **However, live testing on April 6, 2026 confirmed DRA driver v1.0.0 does NOT support Inferentia2** — the driver binary rejects `inf2.24xlarge` with `unsupported instance type`. Only Trainium instances are functional. See the [deep-dive analysis in private_code_assistant.md](private_code_assistant.md#appendix-a-neuron-scheduler--ovn-kubernetes-annotation-conflict----deep-dive) for root cause details, live DRA validation results, upstream status, and all fix options.
 
 ### MoE (Mixture-of-Experts) Model Notes
 
@@ -3454,10 +3454,19 @@ The [AWS Neuron DRA driver](https://awsdocs-neuron.readthedocs-hosted.com/en/lat
 
 Key considerations for DRA adoption:
 - DRA is GA in OpenShift 4.21 (Kubernetes 1.34)
-- Neuron DRA supports Inf1, Inf2, Trn1, Trn2, and Trn3 instance types
+- AWS docs claim Neuron DRA supports Inf1, Inf2, Trn1, Trn2, and Trn3 instance types
 - Installation uses the Neuron Helm chart (`draDriver.enabled=true`, `devicePlugin.enabled=false`) instead of the legacy device plugin + scheduler
 - KServe `InferenceService` does not yet support `resourceClaims` natively — may require raw `Deployment` mode or upstream KServe changes
-- Not yet validated on ROSA HCP or with vLLM Neuron workloads in production
+
+**Live validation (April 6, 2026) — DRA v1.0.0 DOES NOT support Inferentia2:**
+
+Tested on ROSA HCP 4.21.7 with `inf2.24xlarge`. Helm chart `neuron-helm-chart:1.5.0`, driver image `neuron-dra-driver:1.0.0`.
+
+1. **DaemonSet affinity excludes Inferentia**: The `neuron-dra-driver-kubelet-plugin` DaemonSet ships with `nodeAffinity` limited to `trn1.*`, `trn2.*`, `trn3.*` — no `inf1.*` or `inf2.*`. Result: `DESIRED=0` on Inferentia nodes.
+2. **After manual affinity patch**: Driver pod schedules but crashes immediately: `Error: failed to create device state: failed to discover devices: unsupported instance type: inf2.24xlarge`. The driver binary's `mappings.go` does not recognize Inferentia2 instance types.
+3. **Conclusion**: DRA driver v1.0.0 only supports Trainium instances. Inferentia2 support is not functional despite documentation claims. The legacy Neuron Operator stack (device-plugin + neuron-scheduler + MutatingAdmissionWebhook) remains the only working option for Inferentia2 on OpenShift.
+
+Upstream action recommended: File issue on `aws-neuron/neuron-helm-chart` for missing Inferentia support in both DaemonSet affinity and driver binary instance mapping.
 
 See [private_code_assistant.md Appendix A](private_code_assistant.md#appendix-a-neuron-scheduler--ovn-kubernetes-annotation-conflict----deep-dive) and [inferentia-networking-issue.md](inferentia-networking-issue.md) for the complete deep-dive analysis.
 
@@ -3469,6 +3478,250 @@ See [private_code_assistant.md Appendix A](private_code_assistant.md#appendix-a-
 4. **Evaluate Neuron DRA migration**: When KServe adds `resourceClaims` support, migrate from the legacy neuron-scheduler + device plugin to the Neuron DRA driver. This is the definitive fix.
 5. **Standalone Inferentia fallback**: If the webhook is not deployed, run Inferentia models via their own `InferenceService` with a dedicated `Route`, independent of llm-d.
 6. **File upstream bug**: Track AWS Neuron Operator releases for annotation patch behavior changes, and file an issue on `awslabs/operator-for-ai-chips-on-aws` describing the OVN annotation overwrite.
+
+---
+
+## Section 5: AWS Trainium Deployment with Neuron DRA Driver
+
+This section covers deploying vLLM on **AWS Trainium** (`trn1.32xlarge`) using the **Neuron DRA (Dynamic Resource Allocation) driver**, validated on April 9, 2026.
+
+### Trainium vs Inferentia2: Key Differences
+
+| Property | Inferentia2 (inf2) | Trainium (trn1) |
+|----------|-------------------|-----------------|
+| Primary use case | Inference | Training + inference |
+| NeuronCore version | NeuronCore-v2 | NeuronCore-v2 |
+| Device allocation | Legacy device-plugin + neuron-scheduler | **Neuron DRA driver** (Kubernetes-native) |
+| DRA driver support | Not supported (filtered out in Helm chart) | Supported (v1.0.0) |
+| FP8 support | No | No (trn1); Yes (trn2) |
+| Max HBM per instance | 384 GB (inf2.48xlarge) | 512 GB (trn1.32xlarge) |
+
+### Trainium Instance Types
+
+| Instance | NeuronCores | HBM (GB) | vCPUs | Memory (GiB) | On-Demand $/hr | Availability |
+|----------|-------------|----------|-------|--------------|----------------|-------------|
+| `trn1.2xlarge` | 2 | 32 | 8 | 32 | $1.34 | Limited AZs |
+| `trn1.32xlarge` | 32 | 512 | 128 | 512 | $21.50 | us-east-2c only |
+| `trn1n.32xlarge` | 32 | 512 | 128 | 512 | $24.78 | Limited |
+| `trn2.48xlarge` | 64 | 1536 | 192 | 1536 | ~$45 | Capacity Blocks only |
+
+### Step-by-Step Trainium Deployment
+
+#### Step T1: Create Private Subnet (if required)
+
+Trainium instances may only be available in specific AZs. If your ROSA cluster lacks a subnet in that AZ:
+
+```bash
+aws ec2 create-subnet \
+  --vpc-id <vpc-id> \
+  --cidr-block 10.0.12.0/24 \
+  --availability-zone us-east-2c \
+  --tag-specifications 'ResourceType=subnet,Tags=[{Key=Name,Value=rosa-pca-private-c}]'
+
+aws ec2 associate-route-table \
+  --subnet-id <new-subnet-id> \
+  --route-table-id <private-route-table-id>
+```
+
+#### Step T2: Create Trainium Machine Pool
+
+```bash
+rosa create machinepool \
+  --cluster=<cluster-name> \
+  --name=trn1-32xl \
+  --instance-type=trn1.32xlarge \
+  --replicas=1 \
+  --taints="aws.amazon.com/neuroncore=present:NoSchedule" \
+  --subnet=<subnet-id> \
+  --disk-size=300GiB
+```
+
+#### Step T3: Upgrade Neuron Operator (if needed)
+
+Ensure the Neuron Operator is at v1.1.2 or later. Check the installed CSV:
+
+```bash
+oc get csv -n openshift-operators | grep neuron
+```
+
+If an upgrade is pending, approve the install plan:
+
+```bash
+oc patch installplan <install-plan-name> -n openshift-operators --type='merge' -p '{"spec":{"approved":true}}'
+```
+
+#### Step T4: Label the Trainium Node
+
+The Neuron Operator's KMM Module requires a specific label. If NFD doesn't apply it automatically:
+
+```bash
+oc label node <trn1-node> feature.node.kubernetes.io/aws-neuron=true
+```
+
+Also patch the Module CR to add the neuroncore toleration:
+
+```bash
+oc patch module neuron-device-config -n openshift-operators --type='json' \
+  -p='[{"op":"add","path":"/spec/tolerations/-","value":{"key":"aws.amazon.com/neuroncore","operator":"Exists","effect":"NoSchedule"}}]'
+```
+
+#### Step T5: Load Neuron Kernel Module
+
+On RHCOS with SELinux Enforcing, the kernel module requires correct SELinux context:
+
+```bash
+oc debug node/<trn1-node> -- chroot /host bash -c "
+  cp /tmp/neuron.ko /root/neuron.ko
+  chcon -t modules_object_t /root/neuron.ko
+  insmod /root/neuron.ko
+  lsmod | grep neuron
+  ls -la /dev/neuron*
+"
+```
+
+#### Step T6: Install Neuron DRA Driver
+
+```bash
+oc create namespace neuron-dra-driver
+oc label namespace neuron-dra-driver app.kubernetes.io/managed-by=Helm
+oc annotate namespace neuron-dra-driver \
+  meta.helm.sh/release-name=neuron-dra \
+  meta.helm.sh/release-namespace=neuron-dra-driver
+
+oc adm policy add-scc-to-user privileged \
+  system:serviceaccount:neuron-dra-driver:neuron-dra-driver-sa
+
+helm install neuron-dra oci://public.ecr.aws/neuron/neuron-helm-chart \
+  --version 1.5.0 \
+  --namespace neuron-dra-driver \
+  --set draDriver.enabled=true \
+  --set devicePlugin.enabled=false \
+  --set scheduler.enabled=false \
+  --set npd.enabled=false \
+  --set "draDriver.tolerations[0].key=aws.amazon.com/neuroncore" \
+  --set "draDriver.tolerations[0].operator=Exists" \
+  --set "draDriver.tolerations[0].effect=NoSchedule"
+```
+
+Verify DRA is running and has advertised devices:
+
+```bash
+oc get pods -n neuron-dra-driver
+oc get deviceclass
+oc logs -n neuron-dra-driver -l app.kubernetes.io/name=neuron-dra-driver --tail=5
+```
+
+Expected output: `Successfully advertised neuron devices to Kubernetes API server deviceCount=16`
+
+#### Step T7: Create ResourceClaimTemplate and PVC
+
+```yaml
+apiVersion: resource.k8s.io/v1
+kind: ResourceClaimTemplate
+metadata:
+  name: trainium-16-cores
+  namespace: llm-d-multi-gpu
+spec:
+  spec:
+    devices:
+      requests:
+      - name: neurons
+        exactly:
+          deviceClassName: neuron.aws.com
+          allocationMode: ExactCount
+          count: 16
+          selectors:
+          - cel:
+              expression: "device.attributes['neuron.aws.com'].instanceType == 'trn1.32xlarge'"
+```
+
+```yaml
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: trainium-model-cache
+  namespace: llm-d-multi-gpu
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 300Gi
+  storageClassName: gp3-csi
+```
+
+#### Step T8: Deploy vLLM on Trainium
+
+The deployment uses `resourceClaims` instead of `resources.limits` for NeuronCore allocation:
+
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: qwen3-coder-trainium
+  namespace: llm-d-multi-gpu
+spec:
+  replicas: 1
+  template:
+    spec:
+      nodeSelector:
+        node.kubernetes.io/instance-type: trn1.32xlarge
+      tolerations:
+      - key: aws.amazon.com/neuroncore
+        operator: Exists
+        effect: NoSchedule
+      resourceClaims:
+      - name: neurons
+        resourceClaimTemplateName: trainium-16-cores
+      containers:
+      - name: kserve-container
+        image: public.ecr.aws/neuron/pytorch-inference-vllm-neuronx:0.13.0-neuronx-py312-sdk2.28.0-ubuntu24.04
+        env:
+        - name: NEURON_RT_VISIBLE_CORES
+          value: "0-15"
+        resources:
+          claims:
+          - name: neurons
+          requests:
+            cpu: "16"
+            memory: 200Gi
+```
+
+Key vLLM arguments for Trainium with 16 NeuronCores and 16k context:
+
+```
+--tensor-parallel-size 16
+--max-model-len 16384
+--max-num-seqs 16
+--block-size 32
+--num-gpu-blocks-override 64
+--additional-config '{"tp_degree": 16, "moe_tp_degree": 1, "moe_ep_degree": 16, ...}'
+```
+
+### DRA vs Legacy Device Plugin
+
+| Feature | Legacy (device-plugin + scheduler) | DRA Driver |
+|---------|-----------------------------------|-----------|
+| Resource type | `resources.limits["aws.amazon.com/neuroncore"]` | `resourceClaims` + `ResourceClaimTemplate` |
+| Scheduler | Custom `neuron-scheduler` extension | Default kube-scheduler with DRA support |
+| Topology awareness | Neuron scheduler handles | DRA driver handles via device group IDs |
+| Supported accelerators | Inferentia2 + Trainium | Trainium only (v1.0.0) |
+| Kubernetes version | Any | 1.31+ (DRA GA in 1.32 / OpenShift 4.21) |
+| Device discovery | Device plugin DaemonSet | DRA kubelet plugin DaemonSet |
+
+### Verified Deployment (April 9, 2026)
+
+| Component | Version |
+|-----------|---------|
+| ROSA HCP | 4.21.7 |
+| AWS Neuron Operator | 1.1.2 |
+| Neuron DRA Driver | 1.0.0 (Helm chart 1.5.0) |
+| Neuron SDK | 2.28.0 |
+| Neuron kernel module | 2.25.4.0 |
+| vLLM (Neuron) | 0.13.0 |
+| Instance | trn1.32xlarge (us-east-2c) |
+| Model | Qwen/Qwen3-Coder-30B-A3B-Instruct (BF16) |
+| TP | 16 NeuronCores |
+| Context | 16,384 tokens |
 
 ---
 
