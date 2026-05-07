@@ -1,0 +1,46 @@
+# LLMInferenceService — Qwen3.6-35B-A3B-FP8 on NVIDIA A100 80 GB via RHOAI 3.3.2
+# ARO deployment: Standard_NC24ads_A100_v4 GPU nodes (80 GB HBM2)
+# Official Qwen FP8 quantized model (~37 GB vs ~70 GB BF16) — native vLLM FP8 support.
+# Qwen3.6-35B-A3B is a MoE model (~3B active params) — low memory footprint, high quality.
+#
+# IMPORTANT: The qwen3_5_moe architecture requires vLLM >= 0.17.0. RHOAI 3.3.2 ships
+# vLLM 0.13.0 which does not support it. Post-deploy, the RHOAI operator must be scaled
+# down and the deployment image patched to vllm/vllm-openai:v0.17.1. See README.md for
+# the manual workaround steps.
+#
+# VLLM_ADDITIONAL_ARGS limits max context length to 16384 (vs 262144 default) to fit in
+# a single A100 80 GB GPU. gpu-memory-utilization is set to 0.90 for safe headroom.
+---
+apiVersion: serving.kserve.io/v1alpha1
+kind: LLMInferenceService
+metadata:
+  name: qwen36-35b
+  namespace: ai-serving
+  annotations:
+    argocd.argoproj.io/sync-wave: "2"
+    argocd.argoproj.io/sync-options: SkipDryRunOnMissingResource=true
+    opendatahub.io/model-type: generative
+    openshift.io/display-name: "Qwen3.6 35B A3B FP8"
+    security.opendatahub.io/enable-auth: "false"
+spec:
+  model:
+    uri: "hf://Qwen/Qwen3.6-35B-A3B-FP8"
+    name: "Qwen/Qwen3.6-35B-A3B-FP8"
+  replicas: 1
+  template:
+    tolerations:
+      - key: "nvidia.com/gpu"
+        operator: "Exists"
+        effect: "NoSchedule"
+    nodeSelector:
+      nvidia.com/gpu.present: "true"
+    containers:
+      - name: main
+        env:
+          - name: VLLM_ADDITIONAL_ARGS
+            value: "--max-model-len 16384 --gpu-memory-utilization 0.90"
+        resources:
+          requests:
+            nvidia.com/gpu: "1"
+          limits:
+            nvidia.com/gpu: "1"
