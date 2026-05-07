@@ -1,0 +1,64 @@
+# VS Code extension recommendations — per workspace namespace.
+# Created per-namespace because the DevSpaces operator does not reliably
+# propagate ConfigMaps from openshift-devspaces when workspaces start
+# before the ConfigMap exists.
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: vscode-extensions-config
+  namespace: dev1-devspaces
+  labels:
+    controller.devfile.io/mount-to-devworkspace: "true"
+    controller.devfile.io/watch-configmap: "true"
+  annotations:
+    argocd.argoproj.io/sync-wave: "0"
+data:
+  .vscode-extensions.json: |
+    {
+      "recommendations": [
+        "Continue.continue",
+        "saoudrizwan.claude-dev",
+        "RooVeterinaryInc.roo-cline"
+      ]
+    }
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: vscode-extensions-config
+  namespace: dev2-devspaces
+  labels:
+    controller.devfile.io/mount-to-devworkspace: "true"
+    controller.devfile.io/watch-configmap: "true"
+  annotations:
+    argocd.argoproj.io/sync-wave: "0"
+data:
+  .vscode-extensions.json: |
+    {
+      "recommendations": [
+        "Continue.continue",
+        "saoudrizwan.claude-dev",
+        "RooVeterinaryInc.roo-cline"
+      ]
+    }
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: vscode-extensions-config
+  namespace: dev3-devspaces
+  labels:
+    controller.devfile.io/mount-to-devworkspace: "true"
+    controller.devfile.io/watch-configmap: "true"
+  annotations:
+    argocd.argoproj.io/sync-wave: "0"
+data:
+  .vscode-extensions.json: |
+    {
+      "recommendations": [
+        "Continue.continue",
+        "saoudrizwan.claude-dev",
+        "RooVeterinaryInc.roo-cline"
+      ]
+    }
