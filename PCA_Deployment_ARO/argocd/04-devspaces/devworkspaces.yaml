@@ -85,7 +85,6 @@ spec:
         exec:
           component: dev-tools
           commandLine: |
-            # Extension recommendations — VS Code prompts install on workspace open
             mkdir -p /projects/.vscode
             cat > /projects/.vscode/extensions.json <<'EXTJSON'
             {
@@ -97,18 +96,28 @@ spec:
             }
             EXTJSON
 
-            # Roo Code — fallback copy from legacy mount path for the che-code init race
+            # Wait for VS Code server IPC socket, then install extensions
+            for i in $(seq 1 30); do
+              SOCK=$(ls /tmp/vscode-ipc-*.sock 2>/dev/null | head -1)
+              [ -n "$SOCK" ] && break
+              sleep 2
+            done
+            if [ -n "$SOCK" ]; then
+              export LD_LIBRARY_PATH=/checode/checode-linux-libc/ubi8/ld_libs:$LD_LIBRARY_PATH
+              export VSCODE_IPC_HOOK_CLI=$SOCK
+              CODE=/checode/checode-linux-libc/ubi8/bin/remote-cli/code-oss
+              $CODE --install-extension Continue.continue 2>/dev/null || true
+              $CODE --install-extension saoudrizwan.claude-dev 2>/dev/null || true
+              $CODE --install-extension RooVeterinaryInc.roo-cline 2>/dev/null || true
+            fi
+
             mkdir -p /checode/remote/data/User/globalStorage/rooveterinaryinc.roo-cline/settings
             for i in 1 2 3 4 5 6 7 8 9 10; do
               SRC=/checode/checode-linux-libc/User/globalStorage/rooveterinaryinc.roo-cline/provider_profiles.json
-              if [ -f "$SRC" ]; then
-                cp "$SRC" /checode/remote/data/User/globalStorage/rooveterinaryinc.roo-cline/settings/provider_profiles.json
-                break
-              fi
+              [ -f "$SRC" ] && cp "$SRC" /checode/remote/data/User/globalStorage/rooveterinaryinc.roo-cline/settings/provider_profiles.json && break
               sleep 3
             done
 
-            # Continue — writable session dir + symlink from read-only ConfigMap mount
             mkdir -p /home/user/.continue-data
             rm -f /home/user/.continue-data/config.yaml
             ln -sf /home/user/.continue/config.yaml /home/user/.continue-data/config.yaml
@@ -187,13 +196,24 @@ spec:
             }
             EXTJSON
 
+            for i in $(seq 1 30); do
+              SOCK=$(ls /tmp/vscode-ipc-*.sock 2>/dev/null | head -1)
+              [ -n "$SOCK" ] && break
+              sleep 2
+            done
+            if [ -n "$SOCK" ]; then
+              export LD_LIBRARY_PATH=/checode/checode-linux-libc/ubi8/ld_libs:$LD_LIBRARY_PATH
+              export VSCODE_IPC_HOOK_CLI=$SOCK
+              CODE=/checode/checode-linux-libc/ubi8/bin/remote-cli/code-oss
+              $CODE --install-extension Continue.continue 2>/dev/null || true
+              $CODE --install-extension saoudrizwan.claude-dev 2>/dev/null || true
+              $CODE --install-extension RooVeterinaryInc.roo-cline 2>/dev/null || true
+            fi
+
             mkdir -p /checode/remote/data/User/globalStorage/rooveterinaryinc.roo-cline/settings
             for i in 1 2 3 4 5 6 7 8 9 10; do
               SRC=/checode/checode-linux-libc/User/globalStorage/rooveterinaryinc.roo-cline/provider_profiles.json
-              if [ -f "$SRC" ]; then
-                cp "$SRC" /checode/remote/data/User/globalStorage/rooveterinaryinc.roo-cline/settings/provider_profiles.json
-                break
-              fi
+              [ -f "$SRC" ] && cp "$SRC" /checode/remote/data/User/globalStorage/rooveterinaryinc.roo-cline/settings/provider_profiles.json && break
               sleep 3
             done
 
@@ -275,13 +295,24 @@ spec:
             }
             EXTJSON
 
+            for i in $(seq 1 30); do
+              SOCK=$(ls /tmp/vscode-ipc-*.sock 2>/dev/null | head -1)
+              [ -n "$SOCK" ] && break
+              sleep 2
+            done
+            if [ -n "$SOCK" ]; then
+              export LD_LIBRARY_PATH=/checode/checode-linux-libc/ubi8/ld_libs:$LD_LIBRARY_PATH
+              export VSCODE_IPC_HOOK_CLI=$SOCK
+              CODE=/checode/checode-linux-libc/ubi8/bin/remote-cli/code-oss
+              $CODE --install-extension Continue.continue 2>/dev/null || true
+              $CODE --install-extension saoudrizwan.claude-dev 2>/dev/null || true
+              $CODE --install-extension RooVeterinaryInc.roo-cline 2>/dev/null || true
+            fi
+
             mkdir -p /checode/remote/data/User/globalStorage/rooveterinaryinc.roo-cline/settings
             for i in 1 2 3 4 5 6 7 8 9 10; do
               SRC=/checode/checode-linux-libc/User/globalStorage/rooveterinaryinc.roo-cline/provider_profiles.json
-              if [ -f "$SRC" ]; then
-                cp "$SRC" /checode/remote/data/User/globalStorage/rooveterinaryinc.roo-cline/settings/provider_profiles.json
-                break
-              fi
+              [ -f "$SRC" ] && cp "$SRC" /checode/remote/data/User/globalStorage/rooveterinaryinc.roo-cline/settings/provider_profiles.json && break
               sleep 3
             done
 
