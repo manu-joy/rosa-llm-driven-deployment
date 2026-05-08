@@ -147,7 +147,7 @@ For full deployment instructions including the **vLLM 0.17.1 upgrade workaround*
 | Model | `Qwen/Qwen3.6-35B-A3B-FP8` | State-of-the-art code reasoning, FP8 quantized |
 | GPU | NVIDIA A100 80 GB | Single-GPU fit with headroom |
 | dtype | `bf16` | A100 native compute dtype (better than fp16 for training stability) |
-| max-model-len | 16,384 | Capped to fit MoE model + KV cache in single A100 80 GB |
+| max-model-len | 65,536 | Full 64K context window — fits comfortably on A100 80 GB |
 | vLLM version | 0.17.1 | Custom upstream image (RHOAI 3.3.2 ships 0.13.0; qwen3_5_moe requires >= 0.17) |
 | KV cache dtype | `fp8` | Maximises KV cache capacity on A100 |
 | GPU memory utilization | 90% | Leaves 8 GB headroom for activation memory |

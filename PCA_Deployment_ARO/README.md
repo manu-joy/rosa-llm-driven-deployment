@@ -177,7 +177,7 @@ oc get nodes -l nvidia.com/gpu.present=true
 | Inferentia nodes | Optional `inf2.24xlarge` pool | Not applicable (removed) |
 | RHOAI channel | `stable-2.19` | `stable-3.x` (RHOAI 3.3.2) |
 | llm-d / AI Gateway | Technology Preview | **GA at v0.4** |
-| vLLM max-model-len | 32768 (L40S 48 GB) | **16384** (A100 80 GB, capped for MoE) |
+| vLLM max-model-len | 32768 (L40S 48 GB) | **65536** (A100 80 GB) |
 | vLLM version | RHOAI default | **0.17.1** (custom, qwen3_5_moe support) |
 
 ---
@@ -202,7 +202,7 @@ oc set image deployment/qwen36-35b-kserve -n ai-serving \
 
 # 4. Add max-model-len and GPU utilization limits
 oc set env deployment/qwen36-35b-kserve -n ai-serving \
-  VLLM_ADDITIONAL_ARGS="--max-model-len 16384 --gpu-memory-utilization 0.90"
+  VLLM_ADDITIONAL_ARGS="--max-model-len 65536 --gpu-memory-utilization 0.90"
 
 # 5. Verify the model starts successfully
 oc logs -f deployment/qwen36-35b-kserve -n ai-serving -c main
